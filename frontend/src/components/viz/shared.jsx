@@ -24,9 +24,12 @@ export function NextActions({ actions = [], onAction }) {
   if (!Array.isArray(actions) || actions.length === 0) return null
   return (
     <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginTop: 10 }}>
-      {actions.map((a, i) => (
-        <button key={i} className="sug-btn" onClick={() => onAction?.(a)}>{a}</button>
-      ))}
+      {actions.map((a, i) => {
+        const label = typeof a === 'string' ? a : (a.label || a.type || 'Action')
+        return (
+          <button key={i} className="sug-btn" onClick={() => onAction?.(a)}>{label}</button>
+        )
+      })}
     </div>
   )
 }

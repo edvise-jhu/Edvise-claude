@@ -1,6 +1,4 @@
-import { NextActions } from './shared'
-
-export default function UnifiedAnalysisCard({ data, onAction }) {
+export default function UnifiedAnalysisCard({ data }) {
   const indicators = Array.isArray(data?.indicators) ? data.indicators : []
   const total      = Number(data?.summary?.total_students || 0)
   const flagged    = Number(data?.summary?.total_flagged  || 0)
@@ -102,15 +100,6 @@ export default function UnifiedAnalysisCard({ data, onAction }) {
             </div>
           </div>
         )}
-
-        <NextActions
-          actions={[
-            'View grade breakdown →',
-            'Run subgroup analysis →',
-            'Show me students with all 3 flags',
-          ]}
-          onAction={onAction}
-        />
       </div>
     </div>
   )

@@ -1,6 +1,7 @@
 import { useRef } from 'react'
 import { Bar } from 'react-chartjs-2'
 import { chartRefToPngDataUrl, downloadChartPng } from '../../lib/chartRegister'
+import { NextActions } from '../viz/shared'
 
 const TIER_COLORS = {
   critical: 'var(--risk-critical)',
@@ -11,7 +12,7 @@ const TIER_COLORS = {
 
 const GRADE_PALETTE = ['#1565c0', '#d32f2f', '#2e7d32', '#7b1fa2', '#f57c00', '#5c6bc0', '#00838f']
 
-export default function GradeComparisonCard({ data, onAddToReport }) {
+export default function GradeComparisonCard({ data, onAddToReport, onAction }) {
   const chartRef = useRef(null)
   const breakdown = data?.grade_breakdown
   if (!breakdown || Object.keys(breakdown).length === 0) return null
@@ -144,6 +145,31 @@ export default function GradeComparisonCard({ data, onAddToReport }) {
             )
           })}
         </div>
+
+        {(() => {
+          const gradeRows = data?.grades?.length
+            ? data.grades
+            : grades.map((g) => ({
+                label: `Grade ${g}`,
+                flagged_pct: breakdown[g]?.pct_flagged ?? 0,
+              }))
+          if (!gradeRows.length) return null
+          const topGrade = gradeRows.reduce(
+            (a, b) => ((b.flagged_pct || 0) > (a.flagged_pct || 0) ? b : a),
+            gradeRows[0] || {},
+          )
+          const gradeNum = topGrade?.label?.replace('Grade ', '') || ''
+          return (
+            <NextActions
+              actions={[
+                { label: `Which subgroups are driving ${topGrade?.label || 'the highest grade'}'s failure rate? →`, type: 'subgroup_grade', grade: gradeNum },
+                { label: `Show me ${topGrade?.label || 'Grade'} students with all 3 flags`, type: 'student_list', tier: 'triple', grade: gradeNum },
+                { label: 'Compare SEL scores across grades', type: 'sel' },
+              ]}
+              onAction={onAction}
+            />
+          )
+        })()}
       </div>
     </div>
   )

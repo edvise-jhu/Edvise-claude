@@ -3,6 +3,7 @@ import numpy as np
 import anthropic
 import json
 import os
+import re
 from typing import Optional
 
 DEFAULTS = {
@@ -145,7 +146,7 @@ def _generate_fallback_metadata(df: pd.DataFrame, mapping: dict) -> dict:
         'overage':          'Overage for Grade',
         'race':             'Race / Ethnicity',
         'ethnicity':        'Ethnicity',
-        'race_indicator':   'Race / Ethnicity Flag',
+        'race_indicator':   'Race / Ethnicity',
         'sel_factor':       'SEL Survey Score (1-5)',
         'text_response':    'Open-ended Text Response',
     }
@@ -168,9 +169,13 @@ def _generate_fallback_metadata(df: pd.DataFrame, mapping: dict) -> dict:
     metadata = {}
     for col in df.columns:
         role = reverse.get(col, 'ignore')
+        if role == 'race_indicator':
+            label = col.replace('_', ' ').title()
+        else:
+            label = ROLE_LABELS.get(role, col)
         metadata[col] = {
             'role':        role,
-            'label':       ROLE_LABELS.get(role, col),
+            'label':       label,
             'description': '',
             'confidence':  'high' if role != 'ignore' else 'low',
         }
@@ -286,12 +291,14 @@ CRITICAL DISAMBIGUATION RULES (apply these strictly):
    If values are integers and max > 1 -> "days_absent". Never assign both to the same column.
 10. math vs english: rd_/read_ prefixes = english (reading). wr_/writ_ prefixes = math (writing/composition).
     When both exist, rd_ = english, wr_ = math.
+11. For race_indicator columns, the label should be just the group name:
+    'Hispanic' not 'Race: Hispanic', 'Black' not 'Race: Black', 'White' not 'Race: White'.
 
 Return a JSON object where EVERY key is a column name from the input:
 {{
   "column_name": {{
     "role": "one of the exact role strings listed above",
-    "label": "Human-readable name a teacher would understand (e.g. 'Race: Hispanic', 'Attendance Rate', 'SEL: School Connectedness')",
+    "label": "Human-readable name a teacher would understand (e.g. 'Hispanic', 'Attendance Rate', 'School Connectedness')",
     "description": "One sentence explaining what the values represent",
     "confidence": "high | medium | low"
   }}
@@ -746,6 +753,8 @@ def run_unified_analysis(df: pd.DataFrame, mapping: dict, thresholds: dict = Non
       - overlap/intersection counts in the same payload
     """
     t = {**DEFAULTS, **(thresholds or {})}
+    thresholds_used = {**t}
+    thresholds_used["course_failure_label"] = _academic_description(t)
     df = calculate_risk_flags(df, mapping, thresholds)
     df["indicator_count"] = df["flag_count"]
 
@@ -762,7 +771,7 @@ def run_unified_analysis(df: pd.DataFrame, mapping: dict, thresholds: dict = Non
 
     result = {
         "total": total,
-        "thresholds_used": t,
+        "thresholds_used": thresholds_used,
         "indicators": {
             "attendance": {
                 "label": "Chronically Absent",
@@ -916,10 +925,13 @@ def _subgroup_indicator_breakdown(sub: pd.DataFrame) -> Optional[dict]:
     }
 
 
-def run_subgroup_analysis(df: pd.DataFrame, mapping: dict, thresholds: dict = None) -> dict:
+def run_subgroup_analysis(df: pd.DataFrame, mapping: dict, thresholds: dict = None, column_metadata: dict = None) -> dict:
     """School-wide demographic comparison (course failure, chronic absence, overlap per group)."""
     total = len(df)
     df = calculate_risk_flags(df.copy(), mapping, thresholds)
+    print(f"[subgroup debug] has_academic_failure sum={df['has_academic_failure'].sum()} total={len(df)}")
+    print(f"[subgroup debug] thresholds={thresholds}")
+    print(f"[subgroup debug] course_rules={thresholds.get('course_rules') if thresholds else None}")
     df["indicator_count"] = df["flag_count"]
 
     def group_breakdown(mask):
@@ -954,7 +966,7 @@ def run_subgroup_analysis(df: pd.DataFrame, mapping: dict, thresholds: dict = No
                 mask = df[col] == 1
                 bd = group_breakdown(mask)
                 if bd:
-                    bd["name"] = col.replace("_", " ").title()
+                    bd["name"] = (column_metadata or {}).get(col, {}).get('label') or col.replace("_", " ").title()
                     bd["school_pct"] = round(mask.sum() / total * 100, 1) if total else 0
                     bd["all3_school_pct"] = pct_of_all3(mask)
                     race_groups.append(bd)
@@ -1098,7 +1110,7 @@ def _triple_cohort_slice_detail(
 
 
 def run_triple_flag_cohort_subgroup(
-    df: pd.DataFrame, mapping: dict, thresholds: dict = None
+    df: pd.DataFrame, mapping: dict, thresholds: dict = None, column_metadata: dict = None
 ) -> dict:
     """
     Composition of students with all 3 risk flags, broken down by demographic.
@@ -1155,7 +1167,10 @@ def run_triple_flag_cohort_subgroup(
         else:
             mask = cohort[col] == 1
             if int(mask.sum()):
-                race_groups.append(cohort_group(col.replace("_", " ").title(), cohort[mask]))
+                race_groups.append(cohort_group(
+                    (column_metadata or {}).get(col, {}).get('label') or col.replace("_", " ").title(),
+                    cohort[mask],
+                ))
     add_cohort_category("Race / ethnicity", race_groups)
 
     def add_binary_cohort(tab_label: str, col, label_1: str, label_0: str = None) -> None:
@@ -1195,6 +1210,7 @@ def run_grade_subgroup_driver_analysis(
     mapping: dict,
     thresholds: dict = None,
     grade: str = None,
+    column_metadata: dict = None,
 ) -> dict:
     """
     Within one grade, show academic failure rate by demographic subgroup.
@@ -1265,7 +1281,10 @@ def run_grade_subgroup_driver_analysis(
         else:
             mask = grade_df[col] == 1
             if int(mask.sum()):
-                g = driver_group(col.replace("_", " ").title(), mask)
+                g = driver_group(
+                    (column_metadata or {}).get(col, {}).get('label') or col.replace("_", " ").title(),
+                    mask,
+                )
                 if g:
                     race_groups.append(g)
     add_grade_category("Race / ethnicity", race_groups)
@@ -1401,10 +1420,19 @@ def run_sel_analysis(
     sel_cols = [c for c in mapping['sel_factors'] if c in df.columns]
     if not sel_cols:
         return {"available": False}
+    column_metadata = mapping.get('_column_metadata') or {}
+    factor_labels = {
+        col: column_metadata.get(col, {}).get('label') or col.replace('_', ' ').title()
+        for col in sel_cols
+    }
 
     # Drop rows where ALL SEL cols are NaN (students who didn't complete the survey)
     sel_df = df.dropna(subset=sel_cols, how='all')
     overall_avg = sel_df[sel_cols].mean().to_dict()
+    print(f"[sel debug] sel_cols={sel_cols}")
+    print(f"[sel debug] df rows={len(df)} sel_df rows after dropna={len(sel_df)}")
+    print(f"[sel debug] sample sel values: {df[sel_cols].head(3).to_dict()}")
+    print(f"[sel debug] null counts: {df[sel_cols].isnull().sum().to_dict()}")
 
     dim_key = (compare_dimension or "").strip().lower()
     grade_key = str(compare_grade or "").strip().replace("Grade ", "")
@@ -1455,6 +1483,7 @@ def run_sel_analysis(
             "available": True,
             "mode": "demographic_compare",
             "focused": True,
+            "factor_labels": factor_labels,
             "dimension": dim_key,
             "grade": grade_key,
             "default_group": default_key,
@@ -1498,6 +1527,7 @@ def run_sel_analysis(
             "available": True,
             "mode": "grade_compare",
             "focused": True,
+            "factor_labels": factor_labels,
             "compare_grades": normalized,
             "default_group": f"grade_{default_g}",
             "overall_avg": {k: round(v, 2) for k, v in overall_avg.items()},
@@ -1534,6 +1564,7 @@ def run_sel_analysis(
             "available": True,
             "mode": "focused",
             "focused": True,
+            "factor_labels": factor_labels,
             "grade": grade_key,
             "focus_tier": cohort_key,
             "focus_label": _sel_focus_label(cohort_key, grade_key),
@@ -1554,6 +1585,7 @@ def run_sel_analysis(
 
     result = {
         "available":   True,
+        "factor_labels": factor_labels,
         "overall_avg": {k: round(v, 2) for k, v in overall_avg.items()},
         "groups":      {},
     }
@@ -1564,6 +1596,100 @@ def run_sel_analysis(
         result["groups"][group_name] = _sel_group_payload(group_df, sel_cols, overall_avg)
 
     return result
+
+
+ROW_LEVEL_MAX_RECORDS = 300
+
+
+def _extract_student_id_from_message(message: str) -> Optional[str]:
+    """Parse a student ID from a teacher message (e.g. 'student 1001')."""
+    text = (message or "").strip()
+    if not text:
+        return None
+    patterns = (
+        r"student\s*(?:#|id)?\s*[:.]?\s*(\d+)",
+        r"student\s+(\d+)",
+        r"\bid\s*[:#]?\s*(\d+)",
+    )
+    for pat in patterns:
+        m = re.search(pat, text, flags=re.IGNORECASE)
+        if m:
+            return m.group(1)
+    return None
+
+
+def _find_student_record(records: list, sid_col: str, target: str) -> Optional[dict]:
+    target_digits = re.sub(r"\D", "", target)
+    for row in records:
+        sid = str(row.get(sid_col, "")).strip()
+        if sid == target or re.sub(r"\D", "", sid) == target_digits:
+            return row
+    return None
+
+
+def run_row_level_analysis(
+    df: pd.DataFrame,
+    mapping: dict,
+    thresholds: dict = None,
+    message: str = '',
+) -> dict:
+    """
+    Return the full dataset with risk flags calculated, for row-level queries.
+    Claude receives all columns including SEL, demographics, raw counts.
+    """
+    df = calculate_risk_flags(df.copy(), mapping, thresholds)
+
+    # Include every column — raw + computed flags
+    records = _json_safe_records(df.fillna('').to_dict(orient='records'))
+
+    # Normalize student IDs
+    sid_col = mapping.get('student_id')
+    if sid_col:
+        for row in records:
+            if sid_col in row:
+                row[sid_col] = _normalize_student_id_display(row[sid_col])
+
+    # Build column metadata for Claude context
+    column_metadata = mapping.get('_column_metadata') or {}
+    col_descriptions = {
+        col: column_metadata.get(col, {}).get('label') or col
+        for col in df.columns
+    }
+    sel_cols = mapping.get('sel_factors') or []
+    factor_labels = {
+        col: column_metadata.get(col, {}).get('label') or col
+        for col in sel_cols
+    }
+    stripped_mapping = {k: v for k, v in mapping.items() if not k.startswith('_')}
+    thresholds_used = {**DEFAULTS, **(thresholds or {})}
+
+    target = _extract_student_id_from_message(message)
+    if target and sid_col:
+        record = _find_student_record(records, sid_col, target)
+        if record:
+            return {
+                "available": True,
+                "mode": "student_profile",
+                "student_id": record.get(sid_col, target),
+                "record": record,
+                "col_descriptions": col_descriptions,
+                "factor_labels": factor_labels,
+                "mapping": stripped_mapping,
+                "thresholds_used": thresholds_used,
+            }
+
+    truncated = len(records) > ROW_LEVEL_MAX_RECORDS
+    return {
+        "available": True,
+        "mode": "cohort_sample",
+        "total": len(records),
+        "records": records[:ROW_LEVEL_MAX_RECORDS] if truncated else records,
+        "truncated": truncated,
+        "col_descriptions": col_descriptions,
+        "factor_labels": factor_labels,
+        "mapping": stripped_mapping,
+        "thresholds_used": thresholds_used,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1691,16 +1817,31 @@ def resolve_custom_groups(message: str, mapping: dict, df: pd.DataFrame, prior_l
         "When filtering by risk tier, use the tier field (triple|two_or_more|on_track|high|moderate).\n"
         "Never drop any filter (grade, demographic, tier) just because another filter is present.\n\n"
         f"{prior_context_block}"
+        "CRITICAL SCHEMA RULES:\n"
+        "1. The ONLY valid fields in each group object are: key, label, column, value, tier, grade, exclude\n"
+        "   and any role name from the mapping (e.g. low_ses, ell, special_ed) with integer value 0 or 1.\n"
+        "2. NEVER invent fields like 'filter', 'condition', 'expression', 'attrate < 0.9', or any custom field.\n"
+        "3. For risk-based groups (chronically absent, suspended, failing): use tier field ONLY.\n"
+        "   chronically_absent → tier=two_or_more (NOT column+filter)\n"
+        "   triple_flag → tier=triple\n"
+        "   on_track → tier=on_track\n"
+        "4. For demographic intersections (Low SES AND ELL), add role keys directly to the group object:\n"
+        "   {'key': 'low_ses_ell', 'label': 'Low SES AND ELL', 'column': null, 'value': null,\n"
+        "    'tier': 'triple', 'grade': '7', 'low_ses': 1, 'ell': 1}\n"
+        "5. column+value is ONLY for race_indicator columns (binary 0/1 race flags).\n"
+        "   For all other demographics (ell, low_ses, special_ed), use role keys directly.\n\n"
         "Return ONLY valid JSON — array of group objects or null:\n"
         "[\n"
         "  {\n"
         '    "key": "short_snake_case_identifier",\n'
         '    "label": "Human readable label for chart legend",\n'
-        '    "column": "actual_column_name_from_mapping or null",\n'
+        '    "column": "race_indicator_column_name or null",\n'
         '    "value": 1,\n'
         '    "tier": "triple | two_or_more | on_track | high | moderate | null",\n'
         '    "grade": "6 or 7 or null",\n'
-        '    "exclude": {"ell": 1}  // optional: exclude rows where this role equals this value\n'
+        '    "low_ses": 1,\n'
+        '    "ell": 1,\n'
+        '    "special_ed": 1\n'
         "  }\n"
         "]"
     )
@@ -2321,7 +2462,9 @@ def run_students_analysis(
         'has_suspension', 'has_academic_failure', 'risk_tier', 'flag_count',
     ]
     for role, col in mapping.items():
-        if isinstance(col, (list, tuple, set)):
+        if isinstance(col, (list, tuple, set, dict)):
+            continue
+        if not isinstance(col, str):
             continue
         if col in filtered.columns:
             cols_to_show.append(col)

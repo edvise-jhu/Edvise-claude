@@ -3,15 +3,15 @@ import { openGooglePicker, downloadDriveFile } from '../../lib/googlePicker'
 
 const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000'
 
-function PendingApprovalChip() {
+function PendingApprovalChip({ accessToken }) {
   const [count, setCount] = useState(0)
 
   useEffect(() => {
     async function fetchPending() {
+      if (!accessToken) return
       try {
-        const token = localStorage.getItem('edvise_token')
         const res = await fetch(`${API_URL}/knowledge/pending-count`, {
-          headers: token ? { Authorization: `Bearer ${token}` } : {},
+          headers: { Authorization: `Bearer ${accessToken}` },
         })
         const data = await res.json()
         setCount(data.count || 0)
@@ -20,7 +20,7 @@ function PendingApprovalChip() {
       }
     }
     fetchPending()
-  }, [])
+  }, [accessToken])
 
   if (count === 0) return null
 
@@ -114,9 +114,19 @@ function CsvPreviewTable({ fileData }) {
 }
 
 const MessageInput = forwardRef(function MessageInput({
-  onSend, disabled, onFileSelect, onOpenArtifacts,
-  fileData, thresholds, csvPreviewOpen, onToggleCsvPreview,
-  onReopenCriteria, onRemoveFile,
+  onSend,
+  disabled,
+  onFileSelect,
+  onOpenArtifacts,
+  fileData,
+  documentPdf,
+  onRemoveDocumentPdf,
+  thresholds,
+  csvPreviewOpen,
+  onToggleCsvPreview,
+  onReopenCriteria,
+  onRemoveFile,
+  accessToken,
 }, ref) {
   const [text, setText] = useState('')
   const [activeKB, setActiveKB] = useState(['student_success', 'general'])
@@ -277,6 +287,53 @@ const MessageInput = forwardRef(function MessageInput({
         </div>
       )}
 
+      {documentPdf && (
+        <div style={{
+          borderTop: fileData ? 'none' : '1px solid #e4e9f2',
+          background: '#fff',
+          padding: '6px 14px',
+          display: 'flex',
+          alignItems: 'center',
+          gap: 8,
+          fontSize: 11,
+        }}>
+          <div
+            className="file-pill"
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: 2,
+              background: '#f7f9fc',
+              border: '0.5px solid #e4e9f2',
+              borderRadius: 6,
+              padding: '3px 8px',
+            }}
+          >
+            <svg viewBox="0 0 24 24" fill="none" stroke="#3E94A5" strokeWidth="2" width="13" height="13">
+              <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+              <polyline points="14 2 14 8 20 8"/>
+            </svg>
+            <span style={{ fontWeight: 500, color: '#2A3B7C', fontSize: 11 }}>
+              {documentPdf.filename}
+            </span>
+            {onRemoveDocumentPdf && (
+              <button
+                type="button"
+                onClick={onRemoveDocumentPdf}
+                style={{
+                  background: 'none', border: 'none', cursor: 'pointer',
+                  color: '#7a89b8', fontSize: 13, lineHeight: 1,
+                  padding: '0 2px', marginLeft: 2,
+                }}
+                title="Remove document"
+              >
+                ✕
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+
       {csvPreviewOpen && fileData && (
         <div style={{
           position: 'fixed',
@@ -422,7 +479,7 @@ const MessageInput = forwardRef(function MessageInput({
           🌐 Web search
         </button>
 
-        <PendingApprovalChip />
+        <PendingApprovalChip accessToken={accessToken} />
         {import.meta.env.DEV && (
           <span
             title="Debug: exact source tokens sent to backend"

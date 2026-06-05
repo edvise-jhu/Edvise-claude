@@ -147,9 +147,7 @@ async def gather_sources(
 
     kb_docs: list = []
     kb_scopes: list[str] = []
-    if internal:
-        kb_scopes = []
-    elif "student_success" in selected:
+    if "student_success" in selected:
         kb_scopes.append("global")
     if "school" in selected:
         kb_scopes.append("school")

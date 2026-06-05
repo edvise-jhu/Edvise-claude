@@ -56,8 +56,10 @@ export function stripSuggestionsFromText(text) {
 export function visibleTextWhileStreaming(accumulated) {
   if (!accumulated) return ''
   const idx = findSuggestionsMarkerIndex(accumulated)
-  if (idx === -1) return accumulated
-  return cleanTextBeforeMarker(accumulated, idx)
+  let text = idx === -1 ? accumulated : cleanTextBeforeMarker(accumulated, idx)
+  // Strip any partial or complete markdown table lines
+  text = text.split('\n').filter(line => !line.trimStart().startsWith('|')).join('\n')
+  return text
 }
 
 /** Normalize pill label / click payload to a plain string. */

@@ -58,7 +58,9 @@ export async function uploadFile(file) {
     body: formData,
   })
   if (!res.ok) throw new Error(await res.text())
-  return res.json()
+  const data = await res.json()
+  console.log('[uploadFile] response file_id=', data.file_id)
+  return data
 }
 
 export async function analyzeTextColumn(fileId, column) {
@@ -166,6 +168,7 @@ export async function streamChat({
   history = [],
   data_context = null,
   kb_scope = 'global',
+  documentPdf = null,
   conversationId = null,
   accessToken = null,
   internal = false,
@@ -176,9 +179,11 @@ export async function streamChat({
   onViz,
   onSuggestions,
 }) {
+  const headers = { 'Content-Type': 'application/json', ...authHeaders(accessToken) }
+  console.log('[streamChat] Authorization header present:', !!headers.Authorization)
   const res = await fetch(`${API_URL}/chat/send`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...authHeaders(accessToken) },
+    headers,
     body: JSON.stringify({
       message,
       history,
@@ -186,6 +191,7 @@ export async function streamChat({
       kb_scope,
       conversation_id: conversationId || null,
       internal,
+      ...(documentPdf ? { document_pdf: documentPdf } : {}),
     }),
   })
 
@@ -452,6 +458,28 @@ export async function runGroupComparison(fileId, mapping, message, metric, thres
     { comparison_metric: metric },  // queryFilters
     message, // passed as message for resolve_custom_groups
   )
+}
+
+export async function runRowLevelAnalysis(fileId, mapping, thresholds, message, accessToken = null) {
+  const fid = fileId != null ? String(fileId) : ''
+  console.log('[runRowLevelAnalysis] sending file_id=', fid)
+  if (!fid) throw new Error('Missing file_id for row-level analysis')
+  const res = await fetch(`${API_URL}/analysis/run`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders(accessToken) },
+    body: JSON.stringify({
+      file_id: fid,
+      mapping,
+      thresholds,
+      stage: 'row_level',
+      message,
+    }),
+  })
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}))
+    throw new Error(err.detail || `Row-level analysis failed: ${res.status}`)
+  }
+  return res.json()
 }
 
 export async function confirmVariableNames(fileId, confirmedNames, accessToken = null) {

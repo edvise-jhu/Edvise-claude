@@ -180,7 +180,7 @@ export default function SELAnalysis({ data }) {
                   paddingTop: 2,
                 }}
               >
-                {f.replace(/_/g, ' ')}
+                {data.factor_labels?.[f] || f.replace(/_/g, ' ')}
               </div>
               <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: 4 }}>
                 <ScoreBar value={data.overall_avg[f]} color="#3E94A5" label={`${baselineLabel} for ${f}`} />
@@ -294,7 +294,7 @@ export default function SELAnalysis({ data }) {
                   paddingTop: 2,
                 }}
               >
-                {f.replace(/_/g, ' ')}
+                {data.factor_labels?.[f] || f.replace(/_/g, ' ')}
               </div>
               <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: 4 }}>
                 <ScoreBar value={overall} color="#10B981" label={`School average for ${f}`} />

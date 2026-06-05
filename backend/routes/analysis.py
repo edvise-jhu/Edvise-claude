@@ -26,6 +26,7 @@ from services.analysis_service import (
     apply_dynamic_filters,
     resolve_custom_groups,
     run_group_comparison,
+    run_row_level_analysis,
     analyze_text_column,
     detect_text_columns,
 )
@@ -182,7 +183,8 @@ async def upload_file(file: UploadFile = File(...)):
     if df is None or len(df) == 0:
         raise HTTPException(status_code=400, detail="File appears to be empty or could not be parsed.")
 
-    file_id = f"file_{len(_file_cache)}_{filename}"
+    content_hash = hashlib.md5(content).hexdigest()[:8]
+    file_id = f"file_{content_hash}_{filename}"
     _file_cache[file_id] = df
     _persist_file_cache(file_id, df)
 
@@ -288,6 +290,7 @@ async def run_analysis(req: AnalysisRequest):
     if df is None:
         df = _load_cached_file(req.file_id)
     if df is None:
+        print(f"[analysis/run] file not found: file_id={req.file_id!r} stage={req.stage!r}")
         raise HTTPException(
             status_code=404,
             detail="File session expired. Please upload your data file again.",
@@ -295,7 +298,7 @@ async def run_analysis(req: AnalysisRequest):
 
     # Pre-filter df using the teacher's natural-language message before routing to any
     # analysis function.  Skipped for stages that always need the full school view.
-    FULL_SCHOOL_STAGES = {"unified", "individual", "intersection"}
+    FULL_SCHOOL_STAGES = {"unified", "individual", "intersection", "row_level"}
     if req.message and req.stage not in FULL_SCHOOL_STAGES:
         dynamic_filters = resolve_dynamic_filters(req.message, req.mapping, df)
         if dynamic_filters:
@@ -308,12 +311,15 @@ async def run_analysis(req: AnalysisRequest):
     elif req.stage == "unified":
         result = run_unified_analysis(df, req.mapping, req.thresholds)
     elif req.stage == "subgroup":
-        result = run_subgroup_analysis(df, req.mapping, req.thresholds)
+        column_metadata = req.mapping.get('_column_metadata') or {}
+        result = run_subgroup_analysis(df, req.mapping, req.thresholds, column_metadata)
     elif req.stage == "triple_flag_subgroup":
-        result = run_triple_flag_cohort_subgroup(df, req.mapping, req.thresholds)
+        column_metadata = req.mapping.get('_column_metadata') or {}
+        result = run_triple_flag_cohort_subgroup(df, req.mapping, req.thresholds, column_metadata)
     elif req.stage == "grade_subgroup":
+        column_metadata = req.mapping.get('_column_metadata') or {}
         result = run_grade_subgroup_driver_analysis(
-            df, req.mapping, req.thresholds, req.grade_filter
+            df, req.mapping, req.thresholds, req.grade_filter, column_metadata
         )
     elif req.stage == "sel":
         custom_groups = req.custom_groups
@@ -348,6 +354,10 @@ async def run_analysis(req: AnalysisRequest):
             groups=groups,
             metric=metric,
             thresholds=req.thresholds,
+        )
+    elif req.stage == "row_level":
+        result = run_row_level_analysis(
+            df, req.mapping, req.thresholds, req.message or ''
         )
     elif req.stage == "students":
         result = run_students_analysis(

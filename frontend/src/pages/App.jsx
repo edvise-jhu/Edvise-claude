@@ -116,6 +116,10 @@ export default function MainApp({ session }) {
   function handleNewChat() {
     try {
       sessionStorage.removeItem('edvise_active_conversation_id')
+      sessionStorage.removeItem('edvise_file_session')
+      sessionStorage.removeItem('edvise_column_metadata')
+      sessionStorage.removeItem('edvise_sel_confirmed')
+      console.log('[handleNewChat] file_session cleared:', sessionStorage.getItem('edvise_file_session'))
     } catch {
       /* ignore */
     }

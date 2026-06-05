@@ -48,6 +48,7 @@ class ChatRequest(BaseModel):
     data_context: Optional[dict] = None          # analysis results
     kb_scope: Optional[str] = "global"           # "global" | "school" | "general"
     internal: Optional[bool] = False              # internal orchestration prompt; do not persist as user message
+    document_pdf: Optional[dict] = None          # {base64, filename, mediaType}
 
 
 class SuggestionsPatchBody(BaseModel):
@@ -130,6 +131,7 @@ class IntentClassifyResponse(BaseModel):
     outputs: Optional[list[IntentOutputModel]] = None
     clarify: Optional[ClarifyPayloadModel] = None
     answerable_from_context: Optional[bool] = None
+    kb_scope: Optional[str] = None
 
 
 def _suggestions_marker_match(text: str):
@@ -222,7 +224,7 @@ def _extract_viz_block(text: str) -> tuple[str, Optional[dict]]:
 
 
 INTENT_ACTIONS = {"clarify", "execute", "chat", "show_students", "run_sel", "run_analysis", "generate_artifact"}
-INTENT_OUTPUT_TYPES = {"student_list", "sel", "analysis", "artifact", "group_comparison"}
+INTENT_OUTPUT_TYPES = {"student_list", "sel", "analysis", "artifact", "group_comparison", "row_level"}
 INTENT_ARTIFACT_TYPES = {"action_plan", "agenda", "report"}
 INTENT_TIERS = {
     "critical", "high", "moderate", "on_track", "all", "triple",
@@ -230,6 +232,7 @@ INTENT_TIERS = {
 }
 INTENT_GRADES = {"6", "7", "8", "9", "10", "11", "12"}
 INTENT_ANALYSIS_TYPES = {
+    "unified",
     "subgroup_school_wide",
     "subgroup_triple_cohort",
     "subgroup_grade_driver",
@@ -420,6 +423,8 @@ def _sanitize_one_output(raw: dict, default_grade: Optional[str] = None) -> Opti
         if metric not in ("sel", "absence", "failure", "suspension", "flags"):
             metric = "flags"
         return {"type": "group_comparison", "metric": metric}
+    if otype == "row_level":
+        return {"type": "row_level"}
     tier = raw.get("tier")
     tier = str(tier).strip().lower() if tier is not None else None
     if tier not in INTENT_TIERS:
@@ -564,9 +569,27 @@ def _message_implies_triple_flag(lower: str) -> bool:
     )
 
 
+def _message_wants_foundational_analysis(lower: str) -> bool:
+    """Unified risk overview — not subgroup breakdown."""
+    if re.search(r"\bsubgroup\b", lower):
+        return False
+    return bool(
+        re.search(
+            r"\bfoundational\s+analysis\b|"
+            r"\brun\s+foundational\b|"
+            r"\brun\s+unified\b|"
+            r"^run\s+analysis\b|"
+            r"\brun\s+analysis\b(?!\s+subgroup)",
+            lower,
+        )
+    )
+
+
 def _coerce_outputs_for_message(message: str, outputs: list) -> list:
     """Prefer artifact panel over student table when the teacher asked for a plan."""
     lower = (message or "").lower()
+    if _message_wants_foundational_analysis(lower):
+        return [{"type": "analysis", "analysis_type": "unified"}]
     artifact_type = _message_wants_artifact(lower)
     if not artifact_type:
         outputs = _coerce_triple_flag_tier(message, outputs)
@@ -718,6 +741,10 @@ def _sanitize_intent(parsed: dict, message: str = "") -> dict:
 
     answerable_from_context = bool(parsed.get("answerable_from_context"))
 
+    kb_scope = parsed.get("kb_scope")
+    if kb_scope not in ("student_success", "general"):
+        kb_scope = None
+
     return {
         "action": action,
         "confidence": confidence,
@@ -728,6 +755,7 @@ def _sanitize_intent(parsed: dict, message: str = "") -> dict:
         "outputs": outputs if action == "execute" else None,
         "clarify": clarify if action == "clarify" else None,
         "answerable_from_context": answerable_from_context,
+        "kb_scope": kb_scope,
     }
 
 
@@ -747,13 +775,19 @@ def _classify_teacher_intent(
         "Return ONLY valid JSON. Use this decision tree:\n\n"
 
         "STEP 1 — CONTEXT INHERITANCE\n"
-        "If message references a previously shown list ('these students', 'those 80', 'same list', "
-        "'now show me just the girls') → inherit tier/grade from last_student_list and execute student_list.\n\n"
+        "If message references a previously shown list OR a previously discussed group "
+        "('these students', 'those 80', 'same list', 'can you show me the list', "
+        "'show me the list', 'show me those students') → inherit tier/grade from "
+        "last_student_list OR from the most recently discussed cohort in the conversation. "
+        "If the previous assistant message discussed '80 Grade 7 triple-flag students', "
+        "inherit tier=triple, grade=7. Always prefer the most specific recent group.\n\n"
 
         "STEP 2 — WHAT ACTION TO TAKE\n\n"
 
         "Use action=execute for:\n"
         "A) Explicit run/show/view commands:\n"
+        "   - 'run foundational analysis', 'foundational analysis', 'run analysis' (without 'subgroup') → analysis, analysis_type=unified\n"
+        "     NEVER route these to subgroup_school_wide or subgroup_picker.\n"
         "   - 'run subgroup analysis', 'show subgroup breakdown', 'view subgroup' → analysis, subgroup_school_wide\n"
         "   - 'run well-being analysis', 'run SEL analysis', 'show SEL' → sel\n"
         "   - 'view grade breakdown', 'show grade breakdown', 'grade breakdown' → analysis, grade_breakdown\n"
@@ -766,6 +800,8 @@ def _classify_teacher_intent(
         "   NEVER respond with 'I don't have that data' — always compute it.\n\n"
         "C) Student list with filters:\n"
         "   - 'show me Grade 7 students with all 3 flags', 'list ELL students who are failing' → student_list\n"
+        "   - 'which students X', 'which Grade 7 students have X' → student_list, NOT chat\n"
+        "   - 'which' + any student characteristic → always student_list\n"
         "D) SEL subgroup comparisons:\n"
         "   - 'do Low SES students score lower on SEL in Grade 7', 'compare ELL vs non-ELL SEL in Grade 6' → sel, sel_compare_dimension + sel_compare_grade\n"
         "   - 'compare triple-flag vs on-track on SEL' → sel, sel_cohort=triple, sel_baseline=school\n\n"
@@ -793,8 +829,21 @@ def _classify_teacher_intent(
         "  - academic conditions (\"failing courses\", \"failing math\") → tier=academic_only or keep tier=all and let the message carry the condition\n"
         "  - NEVER drop demographic or academic filters — if the teacher says \"ELL students failing courses\", both conditions must be preserved\n"
         "  - When multiple filters are needed that filters{} can't express, set tier=all and ensure the full message text is passed so resolve_dynamic_filters can extract all conditions\n"
-        f"- analysis: analysis_type (subgroup_school_wide|subgroup_triple_cohort|subgroup_grade_driver|grade_breakdown), subgroup_compare fields from: {field_glossary_for_prompt()}\n"
-        "- sel: sel_cohort, sel_cohort_grade, sel_baseline, sel_compare_dimension (low_ses|special_ed|ell), sel_compare_grade, sel_compare_grades\n"
+        f"- analysis: analysis_type (unified|subgroup_school_wide|subgroup_triple_cohort|subgroup_grade_driver|grade_breakdown), subgroup_compare fields from: {field_glossary_for_prompt()}\n"
+        "  unified = foundational risk overview. 'run foundational analysis' / 'run analysis' → unified, NEVER subgroup.\n"
+        "- row_level: ONLY for individual student profile, Pearson/Spearman correlation between "
+        "two raw columns, or top/bottom N students ranked by a single raw column value. "
+        "If risk.grade_summary already contains the answer (grade rates, counts, overlaps), "
+        "it is action=chat, never row_level.\n"
+        "- sel: full SEL analysis card ONLY for these specific cases:\n"
+        "  1. 'run SEL analysis' / 'run well-being analysis' — no chart type mentioned\n"
+        "  2. 'compare ELL vs non-ELL SEL in Grade 7' — demographic split requiring backend computation\n"
+        "  3. 'compare triple-flag vs on-track on SEL' — cohort vs baseline requiring backend computation\n"
+        "  NEVER use sel when:\n"
+        "  - Teacher asks for a chart/radar/visualization of SEL data already in sel.groups → action=chat\n"
+        "  - Teacher asks for a chart of non-SEL data (suspension, absence, failure) by grade → action=chat\n"
+        "  - The word 'radar', 'bar', 'chart', 'plot' appears with data already in loaded results → action=chat\n"
+        "- sel filters: sel_cohort, sel_cohort_grade, sel_baseline, sel_compare_dimension (low_ses|special_ed|ell), sel_compare_grade, sel_compare_grades\n"
         "- group_comparison: set metric to match what the teacher wants to compare:\n"
         "  metric=sel for SEL/well-being/social-emotional questions\n"
         "  metric=absence for attendance/absence questions\n"
@@ -816,7 +865,9 @@ def _classify_teacher_intent(
         "- Never return student_list alongside group_comparison or sel in the same outputs array.\n"
         "- student_list is a terminal output — if the answer is a roster, that is the complete answer.\n"
         "- group_comparison is only valid when the question explicitly asks to compare two or more groups with no roster.\n"
-        "- sel is only valid when the question explicitly asks about SEL/well-being scores.\n\n"
+        "- sel is only valid when the question explicitly asks for the full SEL analysis card (cohort vs baseline, demographic SEL comparison).\n"
+        "- Charts of loaded aggregates (grade rates, subgroup rates, SEL group averages) → action=chat, not row_level or sel.\n"
+        "- row_level vs sel: full SEL analysis card → sel; individual student / correlation / rank by one column → row_level.\n\n"
 
         "CARD vs CHART RULE:\n"
         "- Use action=execute when the answer requires fetching new data from the backend\n"
@@ -829,31 +880,63 @@ def _classify_teacher_intent(
         "  If it is answerable from context it is action=chat.\n"
         "  If it needs computation it is action=execute with answerable_from_context=false.\n\n"
 
-        "EXAMPLES:\n"
-        "'How does suspension rate differ between Grade 6 and Grade 7?' → chat, answerable_from_context=true\n"
-        "'Which subgroups have the highest failure rates?' → chat, answerable_from_context=true\n"
-        "'How many Grade 7 students have all three flags?' → chat, answerable_from_context=true\n"
-        "'Which subgroups make up the most of triple-flag students?' → chat, answerable_from_context=true\n"
-        "'Show me a bar chart of suspension rates by grade' → chat, answerable_from_context=true\n"
-        "'What interventions are most effective for X?' → chat, answerable_from_context=true\n"
-        "'What should I do for students with Y?' → chat, answerable_from_context=true\n"
-        "'How can I support Z students?' → chat, answerable_from_context=true\n"
-        "'Run subgroup analysis' → execute, analysis, subgroup_school_wide\n"
-        "'Show me students with all 3 flags in Grade 7' → execute, student_list, tier=triple, grade=7\n"
-        "'Compare ELL vs non-ELL SEL scores in Grade 7' → execute, sel, sel_compare_dimension=ell, sel_compare_grade=7\n"
-        "'Do Low SES or SPED students score lower on SEL?' → clarify (multiple demographics)\n"
-        "'Create an action plan for triple-flag Grade 7 students' → execute, artifact, action_plan\n"
-        "'Compare absence >20% vs <20%' → execute, group_comparison, metric=absence\n"
-        "'Which grade has more SPED students with all 3 flags?' → execute, group_comparison, metric=flags\n"
-        "'Show me the 265 Grade 7 ELL students who are failing courses' → execute, student_list, tier=all, grade=7, filters: {demographic_subset: \"ell\"}\n"
-        "'Which Grade 7 ELL students are failing 3+ courses' → execute, student_list, tier=all, grade=7, filters: {demographic_subset: \"ell\", min_course_failures: 3}\n"
-        "'Show me overage ELL SPED triple-flag students' → execute, student_list, tier=triple, filters: {demographic_subset: \"ell\"} — and pass full message to resolve_dynamic_filters for overage+SPED\n\n"
+        "ROUTING DECISION MATRIX (use this, not pattern matching on keywords):\n\n"
+        "1. Is the answer already in risk.grade_summary, risk.indicators, risk.overlap, subgroup.categories, or sel.groups?\n"
+        "   → action=chat, answerable_from_context=true\n"
+        "   This covers: grade comparisons, indicator rates, overlap counts, subgroup rates, SEL group averages.\n"
+        "   Charts/visualizations of this data are also chat — Claude emits a viz block.\n"
+        "   CRITICAL: Check context_summary before routing to execute:\n"
+        "   - subgroup.categories present → 'which subgroups have highest X' is action=chat\n"
+        "   - sel.groups present → 'which SEL factor is lowest for X' is action=chat\n"
+        "   - risk.grade_summary present → 'which grade has most X' is action=chat\n"
+        "   NEVER route to execute+analysis if the data to answer the question is already loaded.\n"
+        "   Re-running analysis that is already in context wastes time and duplicates cards.\n\n"
+        "2. Does the answer require fetching a NEW dataset not in loaded results?\n"
+        "   → action=execute\n"
+        "   - Student roster → student_list\n"
+        "   - Full SEL analysis card (cohort vs baseline) → sel\n"
+        "   - Subgroup breakdown card → analysis, subgroup_*\n"
+        "   - Foundational risk overview → analysis, analysis_type=unified (NOT subgroup)\n"
+        "   - Custom group comparison → group_comparison\n"
+        "   - Document generation → artifact\n\n"
+        "3. Does the answer require raw row-level values (individual record lookup, Pearson correlation, ranking by a raw column)?\n"
+        "   → action=execute, type=row_level\n"
+        "   ONLY for: individual student profile, correlation between two raw columns, top/bottom N by a raw column.\n"
+        "   NOT for: grade comparisons, indicator rates, anything derivable from aggregates.\n\n"
+        "4. Does the message name multiple options without choosing?\n"
+        "   → action=clarify\n\n"
+        "5. Everything else (interventions, strategies, explanations, what to do next)?\n"
+        "   → action=chat, answerable_from_context=true\n\n"
+        "KB SCOPE RULE:\n"
+        "Set kb_scope=student_success when the question asks about:\n"
+        "  - interventions, strategies, programs, approaches for at-risk students\n"
+        "  - what to do about chronic absence, course failure, suspensions, low SEL scores\n"
+        "  - evidence-based practices, research-backed methods\n"
+        "  - how to support SPED, ELL, or other subgroups\n"
+        "Set kb_scope=general for everything else (data questions, analysis requests, artifact generation).\n\n"
+        "ARCHETYPES (one per route — generalize from these):\n"
+        "chat+context: any rate/count/comparison question on loaded data, any chart of loaded data, "
+        "'which subgroups make up the triple-flag students', "
+        "'how many Grade 7 students are Low SES AND ELL', "
+        "any demographic composition question answerable from subgroup.categories, "
+        "'show me a radar chart of SEL factors', 'SEL scores for chronically absent students', "
+        "'chart the SEL factors by risk group', any request for a chart/visualization of SEL data "
+        "when sel.groups is already loaded — answer from sel.groups in context, emit viz block\n"
+        "execute+student_list: 'show me students with X'\n"
+        "execute+row_level: 'which student has the highest X', 'correlate X and Y', 'student 1001s profile'\n"
+        "execute+sel: 'run SEL analysis', 'run well-being analysis', "
+        "'compare ELL vs non-ELL SEL in Grade 7', "
+        "'compare triple-flag vs on-track on SEL' — full SEL card only\n"
+        "execute+analysis: 'run foundational analysis', 'run subgroup analysis'\n"
+        "execute+artifact: 'create action plan', 'generate agenda'\n"
+        "clarify: 'Low SES or SPED?' — multiple options named without choosing\n\n"
 
         "SCHEMA:\n"
         "{\n"
         '  "action": "chat"|"execute"|"clarify",\n'
         '  "confidence": 0.0-1.0,\n'
         '  "answerable_from_context": true|false|null,\n'
+        '  "kb_scope": "student_success"|"general"|null,\n'
         '  "outputs": [...] or null,\n'
         '  "clarify": {...} or null\n'
         "}\n"
@@ -909,8 +992,10 @@ async def send_message(
     req: ChatRequest,
     authorization: Optional[str] = Header(None),
 ):
+    print(f"[send_message] authorization present: {bool(authorization)}, internal: {req.internal}, conversation_id: {req.conversation_id}")
     is_internal = bool(req.internal)
     gathered = await gather_sources(req.message, req.kb_scope, internal=is_internal)
+    print(f"[gather_sources] kb_scope={req.kb_scope} internal={is_internal} kb_docs={len(gathered['kb_docs'])} selected={gathered['selected']} use_web={gathered['use_web_search']}")
     selected = gathered["selected"]
     kb_docs = gathered["kb_docs"]
     use_web_search = gathered["use_web_search"]
@@ -933,7 +1018,23 @@ async def send_message(
     for msg in (req.history or []):
         if msg.role in ('user', 'assistant') and msg.content.strip():
             messages.append({'role': msg.role, 'content': msg.content})
-    messages.append({'role': 'user', 'content': req.message})
+    if req.document_pdf and req.document_pdf.get('base64'):
+        messages.append({
+            'role': 'user',
+            'content': [
+                {
+                    'type': 'document',
+                    'source': {
+                        'type': 'base64',
+                        'media_type': req.document_pdf.get('mediaType', 'application/pdf'),
+                        'data': req.document_pdf['base64'],
+                    },
+                },
+                {'type': 'text', 'text': req.message},
+            ]
+        })
+    else:
+        messages.append({'role': 'user', 'content': req.message})
 
     user = await _get_user_optional(authorization)
     conversation_id: Optional[str] = None
@@ -968,8 +1069,7 @@ async def send_message(
                     )
                     conversation_id = None
 
-            if not conversation_id and not is_internal:
-                # Avoid titles like "hi" — short first messages get a neutral label
+            if not conversation_id:
                 raw = (req.message or "").strip()
                 if len(raw) > 10:
                     title = raw[:60] if len(raw) > 60 else raw
@@ -1171,7 +1271,7 @@ async def send_message(
                 if "general" in selected and not sources_to_show:
                     sources_to_show.append({"label": "General knowledge", "cls": "src-general"})
 
-            if sources_to_show and not is_internal:
+            if sources_to_show and (not is_internal or kb_docs):
                 yield f"data: {json.dumps({'sources': sources_to_show})}\n\n"
 
             yield 'data: [DONE]\n\n'

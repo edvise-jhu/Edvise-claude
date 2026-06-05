@@ -276,11 +276,20 @@ async def list_documents(
         _annotate_docs_with_uploaders(supabase, docs)
         return docs
 
+    # School scope — require auth and filter to current user only
+    if not authorization or not authorization.startswith('Bearer '):
+        raise HTTPException(status_code=401, detail='Authentication required')
+    from services.supabase_service import get_current_user
+
+    user = await get_current_user(authorization)
+    user_id = user['id']
+
     try:
         result = (
             supabase.table('kb_documents')
             .select('*')
             .eq('scope', 'school')
+            .eq('uploaded_by', user_id)
             .order('created_at', desc=True)
             .execute()
         )
@@ -313,17 +322,26 @@ async def search(req: SearchRequest):
 
 
 @router.get("/pending-count")
-async def pending_count():
-    from services.supabase_service import get_supabase
+async def pending_count(authorization: Optional[str] = Header(None)):
+    from services.supabase_service import get_supabase, get_current_user
     try:
         supabase = get_supabase()
-        result = (
+        user_id = None
+        if authorization and authorization.startswith('Bearer '):
+            try:
+                user = await get_current_user(authorization)
+                user_id = user['id']
+            except HTTPException:
+                pass
+        query = (
             supabase.table("kb_documents")
             .select("id", count="exact")
             .eq("scope", "school")
             .eq("status", "pending")
-            .execute()
         )
+        if user_id:
+            query = query.eq("uploaded_by", user_id)
+        result = query.execute()
     except APIError as e:
         _raise_if_invalid_key(e)
         _raise_if_missing_kb_table(e)

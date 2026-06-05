@@ -16,6 +16,7 @@ import CriteriaSettingCard from '../Cards/CriteriaSettingCard'
 import StudentTableCard from '../Cards/StudentTableCard'
 import ArtifactRenderer from '../ArtifactRenderer'
 import VizRouter from '../VizRouter'
+import StudentProfileCard from '../viz/StudentProfileCard'
 
 const STARTERS = [
   { title: 'Foundational Analysis', desc: 'Attendance, behavior & academic risk' },
@@ -346,7 +347,9 @@ function InlineCard({ msg, onActionClick, onAddToReport, onViewHighestRiskStuden
         />
       )
     case 'student_table':
-      return <StudentTableCard data={msg.data} />
+      return <StudentTableCard data={{ ...msg.data, onAction: onActionClick }} />
+    case 'student_profile':
+      return <StudentProfileCard data={msg.data} />
     case 'grade_comparison':
       if (Array.isArray(msg.data?.grades) && msg.data.grades.length > 0) {
         return (
@@ -356,10 +359,10 @@ function InlineCard({ msg, onActionClick, onAddToReport, onViewHighestRiskStuden
           />
         )
       }
-      return <GradeComparisonCard data={msg.data} onAddToReport={add} />
+      return <GradeComparisonCard data={msg.data} onAddToReport={add} onAction={onActionClick} />
     case 'sel':
     case 'sel_fallback':
-      return <SELFallbackCard data={msg.data} />
+      return <SELFallbackCard data={msg.data} onAction={onActionClick} />
     case 'intent_picker':
       return <IntentPickerCard data={msg.data} onSelect={msg.onSelect} />
     case 'clarify_wizard':
@@ -434,6 +437,31 @@ function AssistantMessage({ msg, isLast, threadBusy, onSuggestionClick, onAddToR
                 {showCursor ? <TypingIndicator /> : null}
               </>
             )}
+          {msg.actionPills?.length > 0 && (
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, margin: '12px 0 4px' }}>
+              {msg.actionPills.map((pill, i) => (
+                <button
+                  key={i}
+                  type="button"
+                  className="sug-btn"
+                  style={{
+                    border: '1px solid #3E94A5',
+                    color: i === 0 ? '#fff' : '#3E94A5',
+                    background: i === 0 ? '#3E94A5' : 'transparent',
+                    borderRadius: 999,
+                    padding: '6px 14px',
+                    fontSize: 12,
+                    fontWeight: 500,
+                    cursor: 'pointer',
+                    whiteSpace: 'nowrap',
+                  }}
+                  onClick={() => onSuggestionClick(pill)}
+                >
+                  {pill.label}
+                </button>
+              ))}
+            </div>
+          )}
           {msg.sources && msg.sources.length > 0 && (
             <div className="sources" style={{ marginTop: 10, display: 'grid', gap: 8 }}>
               {[

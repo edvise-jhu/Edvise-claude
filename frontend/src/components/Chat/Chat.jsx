@@ -10,6 +10,7 @@ import {
   updateMessageSuggestions,
   saveAnalysisState,
   getAnalysisState,
+  runRowLevelAnalysis,
 } from '../../lib/api'
 import { sanitizeStudentListAssistantText } from '../../lib/stripMarkdownTables'
 import { pickThresholds as mergeThresholdPayload } from '../../lib/criteriaUtils'
@@ -382,7 +383,20 @@ function wantsTripleFlagCohortSubgroup(text) {
 }
 
 /** Local fallback when classify-intent fails — mirrors backend _fallback_analysis_type. */
+function wantsFoundationalAnalysis(text) {
+  const lower = (text || '').toLowerCase()
+  if (/\bsubgroup\b/.test(lower)) return false
+  return (
+    /\bfoundational\s+analysis\b/.test(lower) ||
+    /\brun\s+foundational\b/.test(lower) ||
+    /\brun\s+unified\b/.test(lower) ||
+    /^run\s+analysis\b/.test(lower.trim()) ||
+    /\brun\s+analysis\b/.test(lower)
+  )
+}
+
 function inferAnalysisTypeFromText(text, stage) {
+  if (wantsFoundationalAnalysis(text)) return 'unified'
   if (isGradeBreakdownRequest(text)) return 'grade_breakdown'
   if (wantsGradeSubgroupDriverAnalysis(text)) return 'subgroup_grade_driver'
   if (wantsTripleFlagCohortSubgroup(text)) return 'subgroup_triple_cohort'
@@ -399,6 +413,15 @@ function inferAnalysisTypeFromText(text, stage) {
 
 const FILE_SESSION_STORAGE_KEY = 'edvise_file_session'
 
+function getJwtSub(accessToken) {
+  if (!accessToken) return null
+  try {
+    return JSON.parse(atob(accessToken.split('.')[1]))?.sub ?? null
+  } catch {
+    return null
+  }
+}
+
 /** Appended to internal analysis summary prompts so pills match teacher-facing chat. */
 const SUGGESTIONS_PROMPT_SUFFIX = `
 After your summary, add a blank line, then exactly one final line (no code fences, nothing after it):
@@ -411,6 +434,37 @@ function isStreamingAssistantSlot(msg) {
   if (id === '__loading_students__') return true
   if (typeof id === 'string' && id.startsWith('stream-')) return true
   return false
+}
+
+/** Match a single student row when the teacher message names a student ID. */
+function resolveRowLevelStudentForQuery(sourceText, result, mapping) {
+  const sidCol = mapping?.student_id ?? result?.mapping?.student_id
+  if (!sidCol || !Array.isArray(result?.records)) return { studentId: null, record: null }
+  const text = String(sourceText || '')
+  const patterns = [
+    /student\s*(?:#|id)?\s*[:.]?\s*(\d+)/i,
+    /student\s+(\d+)/i,
+    /\bid\s*[:#]?\s*(\d+)/i,
+  ]
+  let target = null
+  for (const re of patterns) {
+    const m = text.match(re)
+    if (m?.[1]) {
+      target = m[1]
+      break
+    }
+  }
+  if (!target) return { studentId: null, record: null }
+  const norm = (v) => String(v ?? '').trim()
+  const targetDigits = target.replace(/\D/g, '')
+  const record = result.records.find((row) => {
+    const sid = norm(row[sidCol])
+    return sid === target || sid.replace(/\D/g, '') === targetDigits
+  }) ?? null
+  return {
+    studentId: record ? record[sidCol] : target,
+    record,
+  }
 }
 
 function patchAssistantById(prev, streamMessageId, patch) {
@@ -502,6 +556,8 @@ export default function Chat({
   const [isGeneratingArtifact, setIsGeneratingArtifact] = useState(false)
   const [analysisStage, setAnalysisStage] = useState(null)
   const [pendingFileData, setPendingFileData] = useState(null)
+  const [documentChatMode, setDocumentChatMode] = useState(false)
+  const [pendingDocumentPdf, setPendingDocumentPdf] = useState(null)
   const [csvPreviewOpen, setCsvPreviewOpen] = useState(false)
   const [contextFileData, setContextFileData] = useState(null)
   const fileDataRef = useRef(null)
@@ -513,40 +569,58 @@ export default function Chat({
   const clarifyRoundRef = useRef(0)
 
   function getFileData() {
-    let direct = fileDataRef.current || pendingFileData || (analysisContext?.file_id ? { file_id: analysisContext.file_id, mapping: analysisContext.mapping || {} } : null)
+    const cur = openConversationId || conversationIdRef.current || null
+    let sessionFd = null
     try {
       const raw = sessionStorage.getItem(FILE_SESSION_STORAGE_KEY)
       if (raw) {
         const o = JSON.parse(raw)
-        const cur = openConversationId || conversationIdRef.current || null
-        // Only ignore session when we know the active conversation and it differs (not while cur is still null)
-        if (o.conversationId != null && cur != null && o.conversationId !== cur) {
-          /* conversation mismatch — ignore session */
-        } else if (o?.file_id) {
-          if (direct?.file_id && o.file_id === direct.file_id) {
-            direct = {
-              ...direct,
-              ...(direct.filename == null && o.filename != null ? { filename: o.filename } : {}),
-              ...(direct.rows == null && o.rows != null ? { rows: o.rows } : {}),
-            }
-          } else if (!direct?.file_id) {
-            return {
-              file_id: o.file_id,
-              mapping: o.mapping || {},
-              ...(o.filename != null ? { filename: o.filename } : {}),
-              ...(o.rows != null ? { rows: o.rows } : {}),
-            }
+        const currentUserId = getJwtSub(accessToken)
+        if (
+          o?.file_id &&
+          (!o.userId || !currentUserId || o.userId === currentUserId) &&
+          (o.conversationId === cur || (o.conversationId == null && cur == null))
+        ) {
+          sessionFd = {
+            file_id: o.file_id,
+            mapping: o.mapping || {},
+            ...(o.filename != null ? { filename: o.filename } : {}),
+            ...(o.rows != null ? { rows: o.rows } : {}),
           }
         }
       }
     } catch { /* ignore */ }
-    if (!direct?.file_id) return null
-    return {
-      file_id: direct.file_id,
-      mapping: direct.mapping || {},
-      ...(direct.filename != null ? { filename: direct.filename } : {}),
-      ...(direct.rows != null ? { rows: direct.rows } : {}),
+
+    const refFd = fileDataRef.current || pendingFileData
+    const ctxFd = analysisContext?.file_id
+      ? {
+          file_id: analysisContext.file_id,
+          mapping: analysisContext.mapping || {},
+        }
+      : null
+
+    // Session (latest upload) wins over saved analysis state — avoids stale file_0_* ids after re-upload.
+    if (sessionFd?.file_id) {
+      const mapping = refFd?.file_id === sessionFd.file_id && refFd?.mapping
+        ? refFd.mapping
+        : sessionFd.mapping
+      return {
+        file_id: sessionFd.file_id,
+        mapping: mapping || {},
+        filename: sessionFd.filename ?? refFd?.filename,
+        rows: sessionFd.rows ?? refFd?.rows,
+      }
     }
+    if (refFd?.file_id) {
+      return {
+        file_id: refFd.file_id,
+        mapping: refFd.mapping || {},
+        ...(refFd.filename != null ? { filename: refFd.filename } : {}),
+        ...(refFd.rows != null ? { rows: refFd.rows } : {}),
+      }
+    }
+    if (ctxFd?.file_id) return ctxFd
+    return null
   }
 
   useEffect(() => {
@@ -561,6 +635,11 @@ export default function Chat({
       const raw = sessionStorage.getItem(FILE_SESSION_STORAGE_KEY)
       if (raw) {
         const o = JSON.parse(raw)
+        const currentUserId = getJwtSub(accessToken)
+        if (o.userId && currentUserId && o.userId !== currentUserId) {
+          setContextFileData(null)
+          return
+        }
         if (o.conversationId && currentConvId && o.conversationId !== currentConvId) {
           setContextFileData(null)
           return
@@ -568,7 +647,7 @@ export default function Chat({
       }
     } catch { /* ignore */ }
     setContextFileData(fd)
-  }, [pendingFileData, analysisContext?.file_id, analysisContext?.mapping, openConversationId])
+  }, [pendingFileData, analysisContext?.file_id, analysisContext?.mapping, openConversationId, accessToken])
 
   function hasUploadedData() {
     return Boolean(getFileData()?.file_id || analysisContext?.file_id)
@@ -621,6 +700,7 @@ export default function Chat({
 
   function persistFileSession(fileId, mapping, fileMeta = null) {
     if (!fileId) return
+    console.log('[persistFileSession] called with fileId=', fileId, new Error().stack.split('\n')[2])
     try {
       const cid = conversationIdRef.current || openConversationId || null
       const fullRef = fullMappingRef.current || {}
@@ -638,6 +718,7 @@ export default function Chat({
         file_id: fileId,
         mapping: enrichedMapping,
         conversationId: cid,
+        userId: getJwtSub(accessToken),
         ...(typeof fileMeta?.filename === 'string' ? { filename: fileMeta.filename } : prev.filename != null ? { filename: prev.filename } : {}),
         ...(typeof fileMeta?.rows === 'number' ? { rows: fileMeta.rows } : typeof prev.rows === 'number' ? { rows: prev.rows } : {}),
       }
@@ -660,6 +741,20 @@ export default function Chat({
     const fid = analysisContext?.file_id
     const mapping = analysisContext?.mapping
     if (!fid || !mapping || typeof mapping !== 'object') return
+    try {
+      const raw = sessionStorage.getItem(FILE_SESSION_STORAGE_KEY)
+      if (raw) {
+        const o = JSON.parse(raw)
+        const cur = openConversationId || conversationIdRef.current || null
+        if (
+          o?.file_id &&
+          o.file_id !== fid &&
+          (o.conversationId === cur || (o.conversationId == null && cur == null))
+        ) {
+          return
+        }
+      }
+    } catch { /* ignore */ }
     fileDataRef.current = { file_id: fid, mapping }
     setPendingFileData((prev) => (prev?.file_id === fid ? prev : { file_id: fid, mapping }))
     persistFileSession(fid, mapping)
@@ -677,6 +772,8 @@ export default function Chat({
   const historyRef = useRef([])
   const conversationIdRef = useRef(null)
   const prevChatSessionKeyRef = useRef(chatSessionKey)
+  const prevUserIdRef = useRef(null)
+  const userIdTrackingInitializedRef = useRef(false)
   const prevOpenConversationIdRef = useRef(openConversationId)
   const actionInFlightRef = useRef(false)
   const lastKbScopeRef = useRef('student_success,general')
@@ -716,6 +813,8 @@ export default function Chat({
         persistActiveConversationId(openConversationId)
         if (switchedConversation) {
           setPendingFileData(null)
+          setPendingDocumentPdf(null)
+          setDocumentChatMode(false)
           fileDataRef.current = null
           setAnalysisStage(null)
         }
@@ -723,7 +822,12 @@ export default function Chat({
           const raw = sessionStorage.getItem(FILE_SESSION_STORAGE_KEY)
           if (raw && openConversationId) {
             const o = JSON.parse(raw)
-            if (o.file_id && o.conversationId === openConversationId) {
+            const currentUserId = getJwtSub(accessToken)
+            if (
+              o.file_id &&
+              o.conversationId === openConversationId &&
+              (!o.userId || !currentUserId || o.userId === currentUserId)
+            ) {
               fileDataRef.current = {
                 file_id: o.file_id,
                 mapping: o.mapping || {},
@@ -818,26 +922,39 @@ export default function Chat({
   }, [openConversationId, accessToken])
 
   useEffect(() => {
-    if (openConversationId) { prevChatSessionKeyRef.current = chatSessionKey; return }
-    const prev = prevChatSessionKeyRef.current
-    if (chatSessionKey !== prev) {
+    const currentUserId = getJwtSub(accessToken)
+    if (openConversationId) {
       prevChatSessionKeyRef.current = chatSessionKey
-      if (chatSessionKey > 0) {
-        setMessages([])
-        historyRef.current = []
-        conversationIdRef.current = null
-        setPendingFileData(null)
-        fileDataRef.current = null
-        setContextFileData(null)
-        setCsvPreviewOpen(false)
-        setAnalysisStage(null)
-        try { sessionStorage.removeItem(FILE_SESSION_STORAGE_KEY) } catch { /* ignore */ }
-        try { sessionStorage.removeItem('edvise_column_metadata') } catch { /* ignore */ }
-        try { sessionStorage.removeItem('edvise_sel_confirmed') } catch { /* ignore */ }
-        selVariablesConfirmedRef.current = false
-      }
+      prevUserIdRef.current = currentUserId
+      userIdTrackingInitializedRef.current = true
+      return
     }
-  }, [openConversationId, chatSessionKey])
+    const prevKey = prevChatSessionKeyRef.current
+    const prevUser = prevUserIdRef.current
+    const sessionKeyChanged = chatSessionKey !== prevKey
+    const userChanged =
+      userIdTrackingInitializedRef.current && prevUser !== currentUserId
+    userIdTrackingInitializedRef.current = true
+    prevUserIdRef.current = currentUserId
+    if (sessionKeyChanged) prevChatSessionKeyRef.current = chatSessionKey
+    if ((sessionKeyChanged && chatSessionKey > 0) || userChanged) {
+      setMessages([])
+      historyRef.current = []
+      conversationIdRef.current = null
+      setPendingFileData(null)
+      setPendingDocumentPdf(null)
+      setDocumentChatMode(false)
+      fileDataRef.current = null
+      setContextFileData(null)
+      setCsvPreviewOpen(false)
+      setAnalysisStage(null)
+      try { sessionStorage.removeItem(FILE_SESSION_STORAGE_KEY) } catch { /* ignore */ }
+      try { sessionStorage.removeItem('edvise_column_metadata') } catch { /* ignore */ }
+      try { sessionStorage.removeItem('edvise_sel_confirmed') } catch { /* ignore */ }
+      try { sessionStorage.removeItem(ACTIVE_CONV_STORAGE_KEY) } catch { /* ignore */ }
+      selVariablesConfirmedRef.current = false
+    }
+  }, [openConversationId, chatSessionKey, accessToken])
 
   useEffect(() => {
     if (openConversationId || !accessToken) return
@@ -872,9 +989,47 @@ export default function Chat({
     if (content && content.trim()) historyRef.current = [...historyRef.current, { role, content }]
   }
 
+  function conversationTitleForSave() {
+    const lastUser = [...historyRef.current].reverse().find((m) => m.role === 'user')
+    const raw = (lastUser?.content || '').trim()
+    if (raw.length > 10) return raw.length > 60 ? raw.slice(0, 60) : raw
+    return undefined
+  }
+
+  function patchLastAssistantActionPills(actionPills) {
+    setMessages((prev) => {
+      const updated = [...prev]
+      for (let i = updated.length - 1; i >= 0; i--) {
+        if (updated[i].role === 'assistant' && !updated[i].isLoading) {
+          updated[i] = { ...updated[i], actionPills }
+          break
+        }
+      }
+      return updated
+    })
+  }
+
   function thresholdsArg() {
     const t = analysisContext?.thresholds
     return t && typeof t === 'object' ? t : null
+  }
+
+  /** Attach per-column labels from session so backend subgroup/SEL routes can read _column_metadata. */
+  function loadColumnMetadata(mapping = {}) {
+    let columnMetadata = mapping._column_metadata || {}
+    try {
+      const stored = sessionStorage.getItem('edvise_column_metadata')
+      if (stored) {
+        columnMetadata = { ...JSON.parse(stored), ...columnMetadata }
+      }
+    } catch { /* ignore */ }
+    return columnMetadata
+  }
+
+  function mappingWithColumnMetadata(mapping = {}) {
+    const column_metadata = loadColumnMetadata(mapping)
+    if (!column_metadata || !Object.keys(column_metadata).length) return mapping
+    return { ...mapping, _column_metadata: column_metadata }
   }
 
   async function handleViewHighestRiskStudents() {
@@ -1005,6 +1160,11 @@ If the list is empty say so in one sentence. No bullet points, no tables, no stu
         { students: { ...result, students, total: students.length }, file_id: fd.file_id, mapping: fd.mapping },
         { stripMarkdownTables: true },
       )
+      patchLastAssistantActionPills([
+        { label: 'Action plan', type: 'artifact', artifact_type: 'action_plan' },
+        { label: 'Brainstorm interventions', type: 'chat', text: 'What interventions would you recommend for these students?' },
+        { label: 'Subgroup breakdown', type: 'subgroup' },
+      ])
       return { result, studentsMeta, qf, mapping: fd.mapping }
     } catch (e) {
       setMessages((prev) => [...prev.filter((m) => m.id !== '__loading_students__'), { role: 'assistant', content: 'Could not load student list. Please make sure your data file is still uploaded.', sources: [] }])
@@ -1033,18 +1193,20 @@ If the list is empty say so in one sentence. No bullet points, no tables, no stu
     switch (analysisType) {
       case 'unified':
       case 'risk_overview': {
-        const risk = analysisContext?.risk
-        if (risk) {
+        await ensureFileDataReady()
+        const fd = getFileData()
+        if (!fd?.file_id) {
           setMessages((prev) => [
             ...prev,
-            { role: 'assistant', content: '', sources: [], viz: toUnifiedViz(risk), isAnalysisMessage: true },
+            {
+              role: 'assistant',
+              content: 'Upload your student data file first, then ask to run foundational analysis.',
+              sources: [],
+            },
           ])
-          await appendAssistantStream(
-            'The school overview is shown above. Confirm the key numbers (total students, flagged count, top indicator) in 1–2 sentences.',
-            { risk },
-            { attachToLastWithViz: true },
-          )
+          return false
         }
+        await runFoundationalAnalysis(fd.file_id, mappingWithColumnMetadata(fd.mapping))
         return true
       }
       case 'grade_breakdown':
@@ -1210,6 +1372,8 @@ If the list is empty say so in one sentence. No bullet points, no tables, no stu
             { suppressViz: true },
           )
         }
+      } else if (type === 'row_level') {
+        await runRowLevelQuery(text)
       } else if (type === 'analysis') {
         await runAnalysisOutput(step, intent, text)
       } else if (type === 'artifact') {
@@ -1273,7 +1437,7 @@ If the list is empty say so in one sentence. No bullet points, no tables, no stu
 
       for (const [ctxKey, stage] of rerunStages) {
         try {
-          const result = await runAnalysis(file_id, mapping, stage, merged)
+          const result = await runAnalysis(file_id, mappingWithColumnMetadata(mapping), stage, merged)
           onAnalysisReady(prev => ({ ...prev, [ctxKey]: result }))
         } catch (e) {
           console.warn(`[applyThresholdsAndRerun] ${stage} rerun failed:`, e)
@@ -1368,11 +1532,12 @@ If the list is empty say so in one sentence. No bullet points, no tables, no stu
           setMessages((prev) => patchAssistantById(prev, streamId, { sources }))
         },
         onConversationId: (id) => {
+          console.log('[onConversationId] id=', id, 'prev=', conversationIdRef.current)
           conversationIdRef.current = id
           attachConversationToFileSession(id)
           persistActiveConversationId(id)
           onConversationHighlight?.(id)
-          onConversationSaved?.()
+          onConversationSaved?.(id, conversationTitleForSave())
         },
         onReplaceText: (nextText) => {
           const stripped = stripSuggestionsFromText(nextText || '')
@@ -1467,7 +1632,50 @@ If the list is empty say so in one sentence. No bullet points, no tables, no stu
 
   // ── File upload ──────────────────────────────────────────────────────────
 
+  async function handleDocumentPdfUpload(file) {
+    setMessages(prev => [...prev, {
+      role: 'assistant',
+      content: '',
+      isLoading: true,
+      loadingLabel: `Reading ${file.name}…`,
+      sources: [],
+      id: '__pdf_uploading__',
+    }])
+
+    try {
+      const base64 = await new Promise((resolve, reject) => {
+        const reader = new FileReader()
+        reader.onload = () => resolve(reader.result.split(',')[1])
+        reader.onerror = reject
+        reader.readAsDataURL(file)
+      })
+
+      setPendingDocumentPdf({ base64, filename: file.name, mediaType: 'application/pdf' })
+      setDocumentChatMode(true)
+      setMessages(prev => [
+        ...prev.filter(m => m.id !== '__pdf_uploading__'),
+        {
+          role: 'assistant',
+          content: `I've read **${file.name}**. What would you like to know about it?`,
+          sources: [],
+          suggestions: [],
+        },
+      ])
+      pushHistory('assistant', `I've read ${file.name}. What would you like to know about it?`)
+    } catch (e) {
+      setMessages(prev => [
+        ...prev.filter(m => m.id !== '__pdf_uploading__'),
+        { role: 'assistant', content: `Could not read PDF: ${e.message}`, sources: [] },
+      ])
+    }
+  }
+
   async function handleFileSelect(file) {
+    if (file.type === 'application/pdf' || file.name.toLowerCase().endsWith('.pdf')) {
+      await handleDocumentPdfUpload(file)
+      return
+    }
+
     // Reset intent so direct uploads always show the intent picker
     // (only starter card clicks should pre-set the intent)
     if (!intentRef._setByStarter) {
@@ -1540,6 +1748,7 @@ If the list is empty say so in one sentence. No bullet points, no tables, no stu
     const mergedMapping = {
       ...fullMapping,        // start with everything Claude detected
       ...confirmedMapping,   // overlay teacher's confirmed choices (these win)
+      _column_metadata: columnMetadata,
     }
     fileDataRef.current = { file_id: fid, mapping: mergedMapping }
     persistFileSession(fid, mergedMapping)
@@ -1581,7 +1790,7 @@ If the list is empty say so in one sentence. No bullet points, no tables, no stu
       mapping,
       file_id: fid,
     }))
-    await runFoundationalAnalysis(fid, mapping, columnMetadata)
+    await runFoundationalAnalysis(fid, mapping, columnMetadata, thresholds)
   }
 
   function handleReopenCriteria() {
@@ -1659,9 +1868,11 @@ If the list is empty say so in one sentence. No bullet points, no tables, no stu
     }
   }
 
-  async function runFoundationalAnalysis(fid, mapping, columnMetadata = {}) {
+  async function runFoundationalAnalysis(fid, mapping, columnMetadata = {}, thresholdsOverride = null) {
     fileDataRef.current = { file_id: fid, mapping }
     persistFileSession(fid, mapping)
+
+    const t = thresholdsOverride || thresholdsArg()
 
     const used = ['attendance', 'days_absent', 'behavior', 'math', 'english', 'failtot', 'grade']
       .filter((k) => mapping?.[k])
@@ -1676,7 +1887,7 @@ If the list is empty say so in one sentence. No bullet points, no tables, no stu
     setAnalysisStage('unified')
 
     try {
-      const risk = await runAnalysis(fid, mapping, 'unified', thresholdsArg())
+      const risk = await runAnalysis(fid, mapping, 'unified', t)
       onAnalysisReady((prev) => { const next = { ...(prev || {}), risk, file_id: fid, mapping }; delete next.students; return next })
 
       setMessages(prev => [
@@ -1685,14 +1896,27 @@ If the list is empty say so in one sentence. No bullet points, no tables, no stu
       ])
 
       await appendAssistantStream(
-        'Summarize this unified foundational analysis in 2-3 sentences. Mention one urgent pattern and one positive signal. Do NOT output markdown tables; the UI already shows indicators and overlap. Do NOT ask about Stage 2 or intersection analysis.',
-        { risk, thresholds: risk.thresholds_used ?? thresholdsArg() },
+        `The school overview card above already shows total counts, indicator rates, and flag combinations. Do NOT repeat those numbers in a table or list.
+
+Write exactly 3 sentences in this order:
+1. The dominant risk indicator school-wide — name it, give the count and percentage from risk.indicators.
+2. The grade with the highest compounding risk — name the grade, cite its two-plus flag rate or all-three count from risk.grade_summary.
+3. One positive signal — the indicator with the lowest rate or the fact that most students have no flags.
+
+Plain prose only. No bullet points. No headers. No markdown tables. No mention of Stage 2 or intersection analysis.`,
+        { risk, thresholds: risk.thresholds_used ?? t },
         { attachToLastWithViz: true },
       )
 
+      patchLastAssistantActionPills([
+        { label: 'Grade breakdown', type: 'grade_breakdown' },
+        { label: 'Subgroup analysis', type: 'subgroup' },
+        { label: 'Student list', type: 'student_list', tier: 'triple' },
+      ])
+
       // Auto-run subgroup analysis
       try {
-        const subgroup = await runAnalysis(fid, mapping, 'subgroup', thresholdsArg())
+        const subgroup = await runAnalysis(fid, mappingWithColumnMetadata(mapping), 'subgroup', t)
         onAnalysisReady((prev) => ({ ...(prev || {}), subgroup, file_id: fid, mapping }))
         if (conversationIdRef.current) {
           void saveAnalysisState(conversationIdRef.current, {
@@ -1706,7 +1930,7 @@ If the list is empty say so in one sentence. No bullet points, no tables, no stu
       // Auto-run SEL after unified if SEL factors exist.
       if (Array.isArray(mapping.sel_factors) && mapping.sel_factors.length > 0) {
         try {
-          const sel = await runAnalysis(fid, mapping, 'sel', thresholdsArg())
+          const sel = await runAnalysis(fid, mappingWithColumnMetadata(mapping), 'sel', t)
           onAnalysisReady((prev) => ({ ...(prev || {}), sel, file_id: fid, mapping }))
         } catch (e) {
           console.warn('[runFoundationalAnalysis] SEL failed:', e)
@@ -1722,7 +1946,7 @@ If the list is empty say so in one sentence. No bullet points, no tables, no stu
           mapping,
           stage: 'unified',
           risk,
-          thresholds: risk.thresholds_used ?? thresholdsArg() ?? null,
+          thresholds: risk.thresholds_used ?? t ?? null,
           filename: uploadMetaRef.current?.filename || null,
           rows: uploadMetaRef.current?.rows || null,
         }, accessToken).catch(() => {})
@@ -1762,7 +1986,7 @@ If the list is empty say so in one sentence. No bullet points, no tables, no stu
       return
     }
 
-    const meta = mapping._column_metadata || {}
+    const meta = loadColumnMetadata(mapping)
 
     setMessages((prev) => [
       ...prev,
@@ -1804,7 +2028,7 @@ If the list is empty say so in one sentence. No bullet points, no tables, no stu
               accessToken,
             ).catch(() => {})
           }
-          void _doRunSubgroupAnalysis(file_id, patchedMapping)
+          void _doRunSubgroupAnalysis(file_id, patchedMapping, '', null, analysisContext?.risk?.overlap?.all_three?.count ?? 0)
         },
       },
     ])
@@ -1824,7 +2048,7 @@ If the list is empty say so in one sentence. No bullet points, no tables, no stu
     try {
       const result = await runAnalysis(
         file_id,
-        mapping,
+        mappingWithColumnMetadata(mapping),
         'grade_subgroup',
         thresholdsArg(),
         'critical',
@@ -1875,7 +2099,7 @@ If the list is empty say so in one sentence. No bullet points, no tables, no stu
     setIsAnalyzing(true)
 
     try {
-      const result = await runAnalysis(file_id, mapping, 'triple_flag_subgroup', thresholdsArg(), null, null, null, sourceText)
+      const result = await runAnalysis(file_id, mappingWithColumnMetadata(mapping), 'triple_flag_subgroup', thresholdsArg(), null, null, null, sourceText)
       onAnalysisReady((prev) => ({
         ...(prev || {}),
         triple_flag_subgroup: result,
@@ -1965,13 +2189,168 @@ Instructions:
     }
   }
 
+  async function runRowLevelQuery(sourceText) {
+    await ensureFileDataReady()
+    const fd = getFileData()
+    console.log('[runRowLevelQuery] file_id=', fd?.file_id, 'mapping=', !!fd?.mapping)
+    if (!fd?.file_id) {
+      setMessages(prev => [...prev, {
+        role: 'assistant',
+        content: 'No data file found. Please re-upload your file to ask about individual students.',
+        sources: [],
+      }])
+      return false
+    }
+
+    setIsStreaming(true)
+
+    try {
+      const result = await runRowLevelAnalysis(
+        String(fd.file_id),
+        mappingWithColumnMetadata(fd.mapping),
+        thresholdsArg(),
+        sourceText,
+        accessToken,
+      )
+      const mapping = mappingWithColumnMetadata(fd.mapping)
+      const { studentId: resolvedId, record: resolvedRecord } = resolveRowLevelStudentForQuery(
+        sourceText,
+        result,
+        mapping,
+      )
+      const rowLevelPayload = result.mode === 'student_profile'
+        ? result
+        : {
+            ...result,
+            ...(resolvedId != null ? { student_id: resolvedId } : {}),
+            ...(resolvedRecord ? { record: resolvedRecord, mode: 'student_profile' } : {}),
+          }
+      const studentId = rowLevelPayload.student_id ?? resolvedId
+      const record = rowLevelPayload.record ?? resolvedRecord
+      onAnalysisReady(prev => ({ ...prev, row_level: rowLevelPayload }))
+
+      if (rowLevelPayload.mode === 'student_profile' || record) {
+        setMessages(prev => [...prev, {
+          role: 'card',
+          type: 'student_profile',
+          data: rowLevelPayload,
+        }])
+      }
+
+      const rowLevelPrompt = record
+        ? `CRITICAL: Follow every rule below exactly. Do not deviate.
+
+Student ${studentId} data is in row_level.record.
+col_descriptions maps EVERY column to its human-readable label — use it for ALL field names.
+factor_labels maps SEL columns to friendly names — use it for ALL SEL scores.
+
+RULES — each violation is a bug:
+1. Every field label MUST come from col_descriptions[column_name]. Never use the raw column name.
+2. Boolean values (true/false) MUST be shown as Yes/No.
+3. Never show raw column names anywhere — not in parentheses, not in code blocks, not in explanations. Always use col_descriptions[col] for the label.
+   WRONG: "1 course failed (tot_crse_fail = 1)"
+   RIGHT: "1 course failed"
+4. Race/ethnicity: scan mapping.race_indicators, find columns where value = 1, show col_descriptions[col] as the race label. Never show column names or raw values like "f_indicator = 1".
+5. SEL scores: label MUST come from factor_labels[col]. Show score as a number only. No "SEL:" prefix.
+6. Academic failure explanation: state which column triggered it using col_descriptions label and raw value — never the raw column name.
+7. Never invent labels like "Not elevated", "Low", "Moderate".
+8. Write one intro sentence identifying the student and their grade before the data sections.
+   Example: "Here is everything on record for Student 1001, currently in Grade 6."`
+        : `CRITICAL: Follow every rule below exactly. Do not deviate.
+
+The teacher asked: "${sourceText}"
+${rowLevelPayload.truncated
+  ? `row_level.records is a sample of ${rowLevelPayload.records?.length ?? 0} students; row_level.total is ${rowLevelPayload.total}. Aggregate (e.g. means by grade) from these values when needed.`
+  : 'Full dataset is in row_level.records.'}
+col_descriptions maps every column to its human-readable label.
+factor_labels maps SEL columns to friendly names.
+
+RULES:
+1. Every field label MUST come from col_descriptions[col]. Never use raw column names.
+2. Boolean values MUST be shown as Yes/No not true/false.
+3. Never show raw column names anywhere — not in parentheses, not in code blocks, not as part of explanations. Always use col_descriptions[col] for the label.
+   WRONG: "1 course failed (tot_crse_fail = 1)"
+   RIGHT: "1 course failed"
+4. Never invent labels like "Not elevated", "Low", "Moderate".
+5. For correlation questions:
+   - Output a scatter viz block showing the two variables.
+   - Write 2-3 sentences of interpretation using human-readable labels.
+   - Do NOT show the computation formula or method.
+   - Do NOT show a table of individual student values.
+   - Do NOT explain how Pearson r is calculated.
+6. For ranking questions (top/bottom N students):
+   - Output the ranked list as plain prose or a simple inline list.
+   - Do NOT render a full student table card.
+   - Use col_descriptions labels for all column names.
+7. Never write "How It Was Computed" or similar sections.
+8. When the teacher asks for a specific chart type, always use exactly that type.
+   If they ask for a radar chart, output a radar viz block — never substitute a bar chart.
+   Radar viz format:
+   \`\`\`viz
+   {
+     "type": "radar",
+     "title": "...",
+     "data": {
+       "labels": ["Factor 1", "Factor 2", ...],
+       "datasets": [
+         {"label": "Group A", "data": [3.4, 3.6, ...]},
+         {"label": "School average", "data": [3.7, 3.8, ...]}
+       ]
+     }
+   }
+   \`\`\`
+   datasets[].data must be flat arrays of numbers matching the labels length.
+   Labels must use factor_labels values, not raw column names.`
+
+      try {
+        await appendAssistantStream(
+          rowLevelPrompt,
+          { ...analysisContext, row_level: rowLevelPayload },
+          { suppressViz: false, includeSuggestions: !record, stripMarkdownTables: true },
+        )
+
+        if (record) {
+          await appendAssistantStream(
+            `Write 3 sentences of interpretation for student ${studentId}:
+1. Their biggest strength — highest SEL score or a low-risk indicator
+2. Their primary concern — active flags or lowest SEL score
+3. One concrete recommended next action a teacher can take
+Plain prose only. No bullet points. No tables. No numbers already shown above.`,
+            { ...analysisContext, row_level: rowLevelPayload },
+            { suppressViz: true, includeSuggestions: true, attachToLastAssistant: true },
+          )
+        }
+      } finally {
+        onAnalysisReady(prev => {
+          const next = { ...prev }
+          delete next.row_level
+          return next
+        })
+      }
+      return true
+    } catch (e) {
+      console.error('[runRowLevelQuery]', e)
+      const detail = e?.message || 'Unknown error'
+      setMessages(prev => [...prev, {
+        role: 'assistant',
+        content: detail.includes('expired') || detail.includes('404')
+          ? `${detail} Try re-uploading your CSV — the server may have restarted.`
+          : `Could not load row-level data: ${detail}`,
+        sources: [],
+      }])
+      return false
+    } finally {
+      setIsStreaming(false)
+    }
+  }
+
   async function runFullSubgroupAnalysis(questionText = '', intentStep = null) {
     const fd = getFileData()
     if (!fd) return
-    await _doRunSubgroupAnalysis(fd.file_id, fd.mapping, questionText, intentStep)
+    await _doRunSubgroupAnalysis(fd.file_id, fd.mapping, questionText, intentStep, analysisContext?.risk?.overlap?.all_three?.count ?? 0)
   }
 
-  async function _doRunSubgroupAnalysis(file_id, mapping, questionText = '', intentStep = null) {
+  async function _doRunSubgroupAnalysis(file_id, mapping, questionText = '', intentStep = null, allThreeCount = null) {
     setMessages(prev => [
       ...prev.filter(m => m.role !== 'card' || m.type !== 'subgroup_picker'),
       { role: 'assistant', content: '', sources: [], id: '__analyzing_sg__' },
@@ -1979,7 +2358,7 @@ Instructions:
     setIsAnalyzing(true)
 
     try {
-      const result = await runAnalysis(file_id, mapping, 'subgroup', thresholdsArg(), null, null, null, questionText)
+      const result = await runAnalysis(file_id, mappingWithColumnMetadata(mapping), 'subgroup', thresholdsArg(), null, null, null, questionText)
       onAnalysisReady(prev => ({ ...(prev || {}), subgroup: result, file_id, mapping }))
 
       setMessages(prev => [
@@ -2002,6 +2381,12 @@ Instructions:
         },
         { attachToLastWithViz: true },
       )
+
+      patchLastAssistantActionPills([
+        { label: 'Well-being analysis', type: 'sel' },
+        { label: 'Student list', type: 'student_list', tier: 'triple' },
+        { label: 'Brainstorm interventions', type: 'chat', text: 'What interventions would you recommend for the highest-risk students?' },
+      ])
 
       setAnalysisStage('unified')
 
@@ -2031,7 +2416,7 @@ Instructions:
 
     // Always reconstruct mapping with sel_factors from fullMappingRef
     // because sel_factors may be lost through sessionStorage serialization or mapping merges
-    const mapping = {
+    const mapping = mappingWithColumnMetadata({
       ...fd.mapping,
       ...(fullMappingRef.current?.sel_factors && !fd.mapping?.sel_factors?.length
         ? { sel_factors: fullMappingRef.current.sel_factors }
@@ -2039,7 +2424,7 @@ Instructions:
       ...(fullMappingRef.current?.race_indicators && !fd.mapping?.race_indicators?.length
         ? { race_indicators: fullMappingRef.current.race_indicators }
         : {}),
-    }
+    })
 
     // Check for SEL data before showing summary
     const selFactors = mapping.sel_factors || []
@@ -2071,14 +2456,7 @@ Instructions:
 
     // Retrieve column metadata — may be stored separately in sessionStorage
     // since _column_metadata is stripped from mapping by backend filters
-    let columnMetadata = mapping._column_metadata || {}
-    try {
-      const stored = sessionStorage.getItem('edvise_column_metadata')
-      if (stored) {
-        const parsed = JSON.parse(stored)
-        columnMetadata = { ...parsed, ...columnMetadata }
-      }
-    } catch { /* ignore */ }
+    let columnMetadata = loadColumnMetadata(mapping)
 
     function deriveSelLabel(col, metadata) {
       if (metadata?.[col]?.label) return metadata[col].label
@@ -2135,7 +2513,7 @@ Instructions:
     ])
     try {
       const queryFilters = selQuery && typeof selQuery === 'object' ? selQuery : null
-      const sel = await runAnalysis(file_id, mapping, 'sel', thresholdsArg(), 'critical', null, queryFilters, sourceText)
+      const sel = await runAnalysis(file_id, mappingWithColumnMetadata(mapping), 'sel', thresholdsArg(), 'critical', null, queryFilters, sourceText)
       onAnalysisReady((prev) => { const next = { ...(prev || {}), sel, file_id, mapping }; delete next.students; return next })
       setMessages(prev => [...prev.filter(m => m.id !== '__analyzing3__')])
 
@@ -2160,6 +2538,14 @@ Instructions:
             : 'The SEL factor analysis results are already displayed in a chart above. Write only the cross-group narrative summary in teacher-friendly language — biggest gaps, what they mean, and one actionable observation per group. Do not generate any chart artifacts or repeat the numbers in table form.'
       await appendAssistantStream(selPrompt, { sel }, { attachToLastWithViz: false })
 
+      if (sel.available !== false) {
+        patchLastAssistantActionPills([
+          { label: 'Action plan', type: 'artifact', artifact_type: 'action_plan' },
+          { label: 'Student list', type: 'student_list', tier: 'triple' },
+          { label: 'Meeting agenda', type: 'artifact', artifact_type: 'agenda' },
+        ])
+      }
+
       // Persist SEL results
       if (conversationIdRef.current) {
         void saveAnalysisState(conversationIdRef.current, {
@@ -2178,8 +2564,10 @@ Instructions:
     const {
       stripMarkdownTables = false,
       attachToLastWithViz = false,
+      attachToLastAssistant = false,
       includeSuggestions = true,
       suppressViz = false,
+      kbScope = 'general',
     } = streamOpts
     const fullPrompt = includeSuggestions && !prompt.includes('SUGGESTIONS_JSON')
       ? `${prompt.trim()}\n${SUGGESTIONS_PROMPT_SUFFIX}`
@@ -2192,6 +2580,9 @@ Instructions:
       if (attachToLastWithViz && last?.role === 'assistant' && last.viz) {
         return [...prev.slice(0, -1), { ...last, sources: last.sources || [], id: streamId, isAnalysisMessage: true }]
       }
+      if (attachToLastAssistant && last?.role === 'assistant') {
+        return [...prev.slice(0, -1), { ...last, sources: last.sources || [], id: streamId, isAnalysisMessage: true }]
+      }
       return [...prev, { role: 'assistant', content: '', sources: [], id: streamId, isAnalysisMessage: true }]
     })
 
@@ -2202,7 +2593,7 @@ Instructions:
         message: fullPrompt,
         history: historyRef.current,
         data_context: contextOverride ? { ...(analysisContext || {}), ...contextOverride } : analysisContext ?? null,
-        kb_scope: 'general',
+        kb_scope: kbScope,
         conversationId: conversationIdRef.current,
         accessToken,
         internal: true,
@@ -2215,13 +2606,16 @@ Instructions:
           const display = visibleTextWhileStreaming(fullResponse)
           setMessages((prev) => patchAssistantById(prev, streamId, { content: display }))
         },
-        onSources: () => { /* internal analysis streams: no KB / general-knowledge pills */ },
+        onSources: (sources) => {
+          setMessages((prev) => patchAssistantById(prev, streamId, { sources }))
+        },
         onConversationId: (id) => {
+          console.log('[onConversationId] id=', id, 'prev=', conversationIdRef.current)
           conversationIdRef.current = id
           attachConversationToFileSession(id)
           persistActiveConversationId(id)
           onConversationHighlight?.(id)
-          onConversationSaved?.()
+          onConversationSaved?.(id, conversationTitleForSave())
         },
         onReplaceText: (nextText) => {
           const stripped = stripSuggestionsFromText(nextText || '')
@@ -2280,6 +2674,18 @@ Instructions:
       { risk, grade_summary: risk?.grade_summary, grades: gradeViz.grades },
       { attachToLastWithViz: true },
     )
+
+    const grades = gradeViz.grades || []
+    const topGrade = grades.reduce(
+      (a, b) => ((b.flagged_pct || 0) > (a.flagged_pct || 0) ? b : a),
+      grades[0] || {},
+    )
+    const gradeNum = topGrade?.label?.replace('Grade ', '') || ''
+    patchLastAssistantActionPills([
+      { label: 'Subgroup analysis', type: 'subgroup_grade', grade: gradeNum },
+      { label: 'Student list', type: 'student_list', tier: 'triple', grade: gradeNum },
+      { label: 'Well-being analysis', type: 'sel' },
+    ])
   }
 
   function buildClassifierContext() {
@@ -2309,6 +2715,9 @@ Instructions:
       sel_available: Boolean(analysisContext?.sel?.available),
       suspension_min_threshold: thresholds?.suspension_min ?? null,
       last_student_list: lastStudentListRef.current || null,
+      subgroup_loaded: Boolean(analysisContext?.subgroup?.categories?.length),
+      sel_loaded: Boolean(analysisContext?.sel?.available),
+      risk_loaded: Boolean(analysisContext?.risk),
     }
   }
 
@@ -2493,7 +2902,7 @@ Instructions:
 
     if (intent.action === 'execute') {
       const CARD_OUTPUT_TYPES = new Set([
-        'student_list', 'analysis', 'sel', 'group_comparison', 'artifact'
+        'student_list', 'analysis', 'sel', 'group_comparison', 'artifact', 'row_level',
       ])
       const needsCard = intent.outputs?.some(o => CARD_OUTPUT_TYPES.has(o?.type))
       if (intent.answerable_from_context && !needsCard) {
@@ -2506,66 +2915,54 @@ Instructions:
     }
 
     if (intent.action === 'chat') {
-      if (intent.answerable_from_context) {
-        // Try answering from context first via appendAssistantStream
-        // but instruct Claude: if exact data isn't available, say so in
-        // ONE sentence then stop — don't explain at length
-        const result = await appendAssistantStream(
-          `The teacher asked: "${text}"\n\n` +
-          `INSTRUCTION:\n` +
-          `1. If the exact answer is in CURRENT ANALYSIS DATA, answer in 2-3 sentences. ` +
-          `Only output a chart if ALL groups use the same metric and population. ` +
-          `Choose chart type: horizontalBar for ranked categories, bar for grade comparisons, ` +
-          `radar for multi-factor, doughnut for part-of-whole.\n` +
-          `2. If the exact answer requires data not in loaded results: ` +
-          `output ONLY the single word NEEDS_COMPUTATION on its own line. ` +
-          `No explanation before it. No text after it. Just: NEEDS_COMPUTATION\n` +
-          `3. Only use exact numbers from CURRENT ANALYSIS DATA. Never estimate. ` +
-          `Only include positive demographic groups — exclude Non-ELL, No IEP etc. ` +
-          `CRITICAL ORDERING RULE: Before writing any summary, sort all values numerically. ` +
-          `Always name the highest value first. Never write "X is highest" when a larger ` +
-          `value exists elsewhere in the data. Check every number before writing. ` +
-          `Never correct yourself mid-sentence. State the ranking correctly the first time. ` +
-          `Never write lead-in phrases before a viz block. ` +
-          `Never end your response with a colon or incomplete sentence like "Here's how..." ` +
-          `Write in plain prose — no bullet points, no headers, no bold labels. ` +
-          `If the question asks about multiple metrics, pick the single most relevant one for the chart, ` +
-          `then mention the other in one sentence of prose. Maximum 3 sentences total. ` +
-          `State your complete answer and stop.`,
-          analysisContext,
-          { suppressViz: false, includeSuggestions: false },
-        )
-        // If Claude signaled it needs computation, run group_comparison
-        if (result?.content?.includes('NEEDS_COMPUTATION')) {
-          setMessages(prev => prev.filter(m => !m.content?.includes('NEEDS_COMPUTATION')))
-          if (hasUploadedData()) {
-            try {
-              await runCustomGroupComparison(text, 'indicators')
-            } catch (e) {
-              // group_comparison failed — fall back to best available answer from context
-              await appendAssistantStream(
-                `The teacher asked: "${text}"\n\n` +
-                `INSTRUCTION: The exact computation wasn't possible. ` +
-                `Answer in 2 sentences using whatever is available in CURRENT ANALYSIS DATA. ` +
-                `Then in one sentence tell the teacher what to ask to get the precise answer.`,
-                analysisContext,
-                { suppressViz: true },
-              )
-            }
+      const effectiveKbScope = intent.kb_scope || 'general'
+      const wantsChart = /\b(chart|radar|bar|plot|graph|visualization|visuali[sz]e)\b/i.test(text)
+      const chartInstruction = wantsChart
+        ? `CRITICAL: The teacher explicitly requested a chart. You MUST output a \`\`\`viz\`\`\` block. ` +
+          `Use type: "${/radar/i.test(text) ? 'radar' : /horizontal/i.test(text) ? 'horizontalBar' : 'bar'}". ` +
+          `Output your 1-2 sentence summary first, then the viz block immediately after. ` +
+          `Never describe a chart without outputting the viz block.\n\n`
+        : ''
+      const result = await appendAssistantStream(
+        chartInstruction + `The teacher asked: "${text}"\n\n` +
+        `INSTRUCTION:\n` +
+        `1. If the exact answer is in CURRENT ANALYSIS DATA, answer in 2-3 sentences. ` +
+        `MANDATORY: If the teacher asked for a chart, radar, bar, or any visualization, ` +
+        `you MUST output a viz block — this overrides everything else. ` +
+        `The teacher said "radar chart" — output type: radar. No exceptions. ` +
+        `Choose chart type from teacher's explicit request first, then: ` +
+        `horizontalBar for ranked categories, bar for grade comparisons, ` +
+        `radar for multi-factor, doughnut for part-of-whole.\n` +
+        `2. If the exact answer requires data not in loaded results AND the question is a ` +
+        `data/computation question (counts, rates, comparisons): ` +
+        `output ONLY the single word NEEDS_COMPUTATION on its own line. ` +
+        `No explanation before it. No text after it. Just: NEEDS_COMPUTATION\n` +
+        `NEVER output NEEDS_COMPUTATION for intervention, strategy, or "what should I do" questions.\n` +
+        `3. Only use exact numbers from CURRENT ANALYSIS DATA. Never estimate. ` +
+        `Only include positive demographic groups — exclude Non-ELL, No IEP etc. ` +
+        `Always name the highest value first. Write in plain prose. Maximum 3 sentences. ` +
+        `State your complete answer and stop.`,
+        analysisContext,
+        { suppressViz: false, includeSuggestions: false, kbScope: effectiveKbScope },
+      )
+      if (result?.content?.includes('NEEDS_COMPUTATION')) {
+        setMessages(prev => prev.filter(m => !m.content?.includes('NEEDS_COMPUTATION')))
+        if (hasUploadedData()) {
+          try {
+            await runCustomGroupComparison(text, 'indicators')
+          } catch (e) {
+            await appendAssistantStream(
+              `The teacher asked: "${text}"\n\n` +
+              `INSTRUCTION: The exact computation wasn't possible. ` +
+              `Answer in 2 sentences using whatever is available in CURRENT ANALYSIS DATA. ` +
+              `Then in one sentence tell the teacher what to ask to get the precise answer.`,
+              analysisContext,
+              { suppressViz: true },
+            )
           }
         }
-        return true
       }
-      if (hasUploadedData()) {
-        try {
-          await runCustomGroupComparison(text, 'indicators')
-        } catch (e) {
-          // fell through — return false so handleSend streams normally
-          return false
-        }
-        return true
-      }
-      return false
+      return true
     }
 
     return false
@@ -2598,9 +2995,73 @@ Instructions:
 
   // ── Main send handler ────────────────────────────────────────────────────
 
+  async function handleDocumentPdfChat(text, sendOpts = {}) {
+    const skipUserMessage = Boolean(sendOpts.skipUserMessage)
+    if (!skipUserMessage) {
+      setMessages(prev => [...prev, { role: 'user', content: text, id: `user-${Date.now()}` }])
+      pushHistory('user', text)
+    } else {
+      pushHistory('user', text)
+    }
+
+    const streamId = `stream-${Date.now()}`
+    setIsStreaming(true)
+    setMessages(prev => [...prev, { role: 'assistant', content: '', sources: [], id: streamId }])
+
+    let fullResponse = ''
+    try {
+      await streamChat({
+        message: text,
+        history: historyRef.current,
+        data_context: null,
+        kb_scope: 'general',
+        conversationId: conversationIdRef.current,
+        accessToken,
+        internal: false,
+        documentPdf: pendingDocumentPdf,
+        onChunk: chunk => {
+          fullResponse += chunk
+          setMessages(prev => patchAssistantById(prev, streamId, { content: fullResponse }))
+        },
+        onConversationId: id => {
+          conversationIdRef.current = id
+          attachConversationToFileSession(id)
+          persistActiveConversationId(id)
+          onConversationHighlight?.(id)
+          onConversationSaved?.(id, conversationTitleForSave())
+        },
+        onReplaceText: nextText => {
+          fullResponse = nextText
+          setMessages(prev => patchAssistantById(prev, streamId, { content: fullResponse }))
+        },
+        onSources: sources => {
+          setMessages(prev => patchAssistantById(prev, streamId, { sources }))
+        },
+        onSuggestions: () => {},
+        onViz: () => {},
+      })
+      finalizeAssistantMessage(setMessages, fullResponse, null, streamId)
+      pushHistory('assistant', fullResponse)
+    } catch (e) {
+      setMessages(prev => patchAssistantById(prev, streamId, {
+        content: 'Something went wrong reading the document. Please try again.',
+      }))
+    } finally {
+      setIsStreaming(false)
+    }
+  }
+
   async function handleSend(text, kbScope = 'global', fromSuggestion = false, sendOpts = {}) {
     text = normalizeSuggestionText(text)
     if (!text) return
+
+    if (documentChatMode && pendingDocumentPdf) {
+      await handleDocumentPdfChat(text, sendOpts)
+      return
+    }
+
+    console.log('[handleSend] conversationIdRef=', conversationIdRef.current, 'openConversationId=', openConversationId)
+    console.log('[handleSend] accessToken present:', !!accessToken)
     console.log('[handleSend] stage=', analysisStage, 'message=', text.slice(0, 60))
     lastKbScopeRef.current = kbScope || 'general'
     const lower = text.toLowerCase()
@@ -2644,6 +3105,7 @@ Instructions:
       historyRef.current[historyRef.current.length - 1]?.content === text
 
     try {
+      console.log('[handleSend] calling streamChat, onConversationSaved=', typeof onConversationSaved)
       await streamChat({
         message: text,
         history: historyRef.current,
@@ -2663,7 +3125,14 @@ Instructions:
         onSources: (sources) => {
           setMessages((prev) => patchAssistantById(prev, streamId, { sources }))
         },
-        onConversationId: (id) => { conversationIdRef.current = id; attachConversationToFileSession(id); persistActiveConversationId(id); onConversationHighlight?.(id); onConversationSaved?.() },
+        onConversationId: (id) => {
+          console.log('[onConversationId] id=', id, 'prev=', conversationIdRef.current)
+          conversationIdRef.current = id
+          attachConversationToFileSession(id)
+          persistActiveConversationId(id)
+          onConversationHighlight?.(id)
+          onConversationSaved?.(id, conversationTitleForSave())
+        },
         onReplaceText: (nextText) => {
           const stripped = stripSuggestionsFromText(nextText || '')
           fullResponse = stripped.text
@@ -2705,29 +3174,95 @@ Instructions:
   }
 
   function handleStarterClick(text) {
-    if (text === 'Foundational Analysis' || text === 'Ask about my data') {
-      intentRef.current = text === 'Foundational Analysis' ? 'foundational_analysis' : 'ask_data'
+    if (text === 'Foundational Analysis') {
+      intentRef.current = 'foundational_analysis'
       intentRef._setByStarter = true
       setMessages((prev) => [
         ...prev,
         { role: 'user', content: text },
         {
           role: 'assistant',
-          content:
-            text === 'Foundational Analysis'
-              ? 'To run foundational analysis, upload your student data file (CSV or Excel) using the upload button below. I’ll map your columns and walk you through criteria before running the analysis.'
-              : 'Upload your student data file (CSV or Excel) using the upload button below. After I map your columns, tell me what you’d like to explore.',
+          content: `To get started, please upload your student data file (CSV or Excel). EdVise works best when the file includes columns like:
+
+- **Student ID / Name**
+- **Attendance** (days present, days enrolled, or absence rate)
+- **Suspensions** (count or yes/no)
+- **Course failures** (count or pass/fail per subject)
+- **Grade level**
+- **Demographic info** (optional, for subgroup analysis later)
+
+Use the upload button below — I'll map your columns and walk you through the criteria before running the analysis.`,
           sources: [],
         },
       ])
-      messageInputRef.current?.openFilePicker?.()
       return
     }
+
+    if (text === 'Ask about my data') {
+      intentRef.current = 'ask_data'
+      intentRef._setByStarter = true
+      setMessages((prev) => [
+        ...prev,
+        { role: 'user', content: text },
+        {
+          role: 'assistant',
+          content: `Upload your student data file (CSV or Excel) using the upload button below. After I map your columns, you can ask me anything — which students are at risk, how grades compare, what the SEL scores show, or anything else about your data.`,
+          sources: [],
+        },
+      ])
+      return
+    }
+
+    if (text === 'Brainstorm interventions') {
+      intentRef.current = null
+      intentRef._setByStarter = false
+      setMessages((prev) => [
+        ...prev,
+        { role: 'user', content: text },
+        {
+          role: 'assistant',
+          content: `I can help brainstorm intervention strategies. What's the main challenge you're working on?`,
+          sources: [],
+          suggestions: [
+            'Chronic absenteeism — students missing 10%+ of days',
+            'Course failures — students failing one or more subjects',
+            'Suspensions and behavioral incidents',
+            'Low school connectedness or adult support scores',
+            'Students with multiple risk flags',
+          ],
+          isAnalysisMessage: true,
+        },
+      ])
+      pushHistory('user', text)
+      return
+    }
+
+    if (text === 'Meeting agenda') {
+      intentRef.current = null
+      intentRef._setByStarter = false
+      handleSend(text, 'global', false)
+      return
+    }
+
     intentRef.current = null
     intentRef._setByStarter = false
     handleSend(text, 'global', false)
   }
   function handleSuggestionClick(raw) {
+    if (raw && typeof raw === 'object') {
+      if (raw.type === 'grade_breakdown') { void runGradeBreakdownFlow(); return }
+      if (raw.type === 'subgroup') { void runSubgroupStage(); return }
+      if (raw.type === 'subgroup_grade') { void runGradeSubgroupDriverAnalysis(raw.grade, `Which subgroups are driving Grade ${raw.grade}'s failure rate?`); return }
+      if (raw.type === 'student_list') { void handleShowStudentList(raw.tier || 'critical', raw.grade || null); return }
+      if (raw.type === 'sel') { void runSELStage({}); return }
+      if (raw.type === 'artifact') { void handleGenerateArtifact(raw.artifact_type || 'action_plan'); return }
+      if (raw.type === 'chat') {
+        void handleSend(raw.text || '', 'global', true)
+        return
+      }
+      return
+    }
+
     const text = normalizeSuggestionText(raw)
     if (!text) return
     void handleSend(text, 'global', true).catch((err) => {
@@ -2785,11 +3320,17 @@ Instructions:
         onFileSelect={handleFileSelect}
         onOpenArtifacts={onOpenArtifacts}
         fileData={contextFileData}
+        documentPdf={pendingDocumentPdf}
+        onRemoveDocumentPdf={() => {
+          setPendingDocumentPdf(null)
+          setDocumentChatMode(false)
+        }}
         thresholds={analysisContext?.thresholds || null}
         csvPreviewOpen={csvPreviewOpen}
         onToggleCsvPreview={() => setCsvPreviewOpen(p => !p)}
         onReopenCriteria={handleReopenCriteria}
         onRemoveFile={handleRemoveFile}
+        accessToken={accessToken}
       />
     </div>
   )

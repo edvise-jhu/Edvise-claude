@@ -148,37 +148,35 @@ function GroupAccordion({
 
       {isOpen && (
         <div style={{ padding: '0 14px 12px', borderTop: '1px solid #e4e9f2' }}>
-          {group.single_flags?.length > 0 && (
-            <div style={{ marginTop: 10, border: '1px solid #e4e9f2', borderRadius: 8, overflow: 'hidden' }}>
-              <div style={{ display: 'flex', justifyContent: 'space-between', padding: '7px 10px', background: '#f7f9fc', borderBottom: '1px solid #e4e9f2' }}>
-                <div style={{ fontSize: 12, fontWeight: 600, color: '#2A3B7C' }}>Single flag only</div>
-                <div style={{ fontSize: 12, fontWeight: 600, color: '#2A3B7C', fontFamily: 'monospace' }}>
-                  {group.single_flags.reduce((s, r) => s + r.count, 0)} · {group.single_flags.reduce((s, r) => s + r.pct, 0).toFixed(1)}%
-                </div>
+          <div style={{ marginTop: 10, border: '1px solid #e4e9f2', borderRadius: 8, overflow: 'hidden' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', padding: '7px 10px', background: '#f7f9fc', borderBottom: '1px solid #e4e9f2' }}>
+              <div style={{ fontSize: 12, fontWeight: 600, color: '#2A3B7C' }}>Single flag only</div>
+              <div style={{ fontSize: 12, fontWeight: 600, color: '#2A3B7C', fontFamily: 'monospace' }}>
+                {(group.single_flags || []).reduce((s, r) => s + r.count, 0)} · {(group.single_flags || []).reduce((s, r) => s + r.pct, 0).toFixed(1)}%
               </div>
-              <ColHeader />
-              {group.single_flags.map((row, i) => (
-                <FlagRow key={i} row={row} groupN={group.n} />
-              ))}
             </div>
-          )}
+            <ColHeader />
+            {group.single_flags?.length > 0
+              ? group.single_flags.map((row, i) => <FlagRow key={i} row={row} groupN={group.n} />)
+              : <div style={{ padding: '8px 10px', fontSize: 11, color: '#7a89b8' }}>None in this group</div>
+            }
+          </div>
 
-          {group.combinations?.length > 0 && (
-            <div style={{ marginTop: 6, border: '1px solid #e4e9f2', borderRadius: 8, overflow: 'hidden' }}>
-              <div style={{ display: 'flex', justifyContent: 'space-between', padding: '7px 10px', background: '#f7f9fc', borderBottom: '1px solid #e4e9f2' }}>
-                <div style={{ fontSize: 12, fontWeight: 600, color: '#2A3B7C' }}>
-                  {isTripleFlagCohort ? 'Higher intensity within group' : 'Combinations (2 flags)'}
-                </div>
-                <div style={{ fontSize: 12, fontWeight: 600, color: '#2A3B7C', fontFamily: 'monospace' }}>
-                  {group.combinations.reduce((s, r) => s + r.count, 0)} · {group.combinations.reduce((s, r) => s + r.pct, 0).toFixed(1)}%
-                </div>
+          <div style={{ marginTop: 6, border: '1px solid #e4e9f2', borderRadius: 8, overflow: 'hidden' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', padding: '7px 10px', background: '#f7f9fc', borderBottom: '1px solid #e4e9f2' }}>
+              <div style={{ fontSize: 12, fontWeight: 600, color: '#2A3B7C' }}>
+                {isTripleFlagCohort ? 'Higher intensity within group' : 'Combinations (2 flags)'}
               </div>
-              <ColHeader />
-              {group.combinations.map((row, i) => (
-                <FlagRow key={i} row={row} groupN={group.n} />
-              ))}
+              <div style={{ fontSize: 12, fontWeight: 600, color: '#2A3B7C', fontFamily: 'monospace' }}>
+                {(group.combinations || []).reduce((s, r) => s + r.count, 0)} · {(group.combinations || []).reduce((s, r) => s + r.pct, 0).toFixed(1)}%
+              </div>
             </div>
-          )}
+            <ColHeader />
+            {group.combinations?.length > 0
+              ? group.combinations.map((row, i) => <FlagRow key={i} row={row} groupN={group.n} />)
+              : <div style={{ padding: '8px 10px', fontSize: 11, color: '#7a89b8' }}>None in this group</div>
+            }
+          </div>
 
           {group.all_three?.count > 0 && (
             <div style={{

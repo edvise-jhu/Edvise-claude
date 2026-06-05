@@ -2,6 +2,8 @@ import { useState, useEffect } from 'react'
 import { supabase } from '../../lib/supabase'
 import { listConversations } from '../../lib/api'
 
+const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000'
+
 export default function Sidebar({
   session,
   onOpenArtifacts,
@@ -15,12 +17,14 @@ export default function Sidebar({
 }) {
   const [signingOut, setSigningOut] = useState(false)
   const [conversations, setConversations] = useState([])
+  const [pendingCount, setPendingCount] = useState(0)
 
   const userInitial = session?.user?.email?.[0]?.toUpperCase() || 'T'
   const userEmail = session?.user?.email || 'Teacher'
   const isAdmin = session?.user?.email === 'edvisejhu@gmail.com'
 
   useEffect(() => {
+    console.log('[Sidebar] loadConversations firing, refreshKey=', refreshKey)
     async function loadConversations() {
       if (!session?.user?.id || session.user.id === 'demo') {
         setConversations([])
@@ -34,6 +38,7 @@ export default function Sidebar({
       }
       try {
         const convos = await listConversations(token)
+        console.log('[Sidebar] conversations loaded:', convos?.length, convos)
         const list = Array.isArray(convos) ? convos : []
         setConversations(list)
       } catch (e) {
@@ -46,9 +51,30 @@ export default function Sidebar({
     }
   }, [session?.access_token, session?.user?.id, refreshKey])
 
+  useEffect(() => {
+    async function fetchPending() {
+      const token = session?.access_token
+      if (!token) return
+      try {
+        const res = await fetch(`${API_URL}/knowledge/pending-count`, {
+          headers: { Authorization: `Bearer ${token}` },
+        })
+        const data = await res.json()
+        setPendingCount(data.count || 0)
+      } catch { /* ignore */ }
+    }
+    if (session?.access_token) fetchPending()
+  }, [session?.access_token, refreshKey])
+
   async function handleSignOut() {
     setSigningOut(true)
     localStorage.removeItem('edvise_demo_session')
+    try {
+      sessionStorage.removeItem('edvise_file_session')
+      sessionStorage.removeItem('edvise_column_metadata')
+      sessionStorage.removeItem('edvise_sel_confirmed')
+      sessionStorage.removeItem('edvise_active_conversation_id')
+    } catch { /* ignore */ }
     await supabase.auth.signOut()
     window.location.href = '/login'
   }
@@ -114,7 +140,7 @@ export default function Sidebar({
             <polyline points="12 6 12 12 16 14" />
           </svg>
           Pending approval
-          <span className="nav-badge">2</span>
+          {pendingCount > 0 && <span className="nav-badge">{pendingCount}</span>}
         </div>
 
         <div className="sb-label" style={{ marginTop: 8 }}>My Actions</div>
@@ -190,8 +216,6 @@ export default function Sidebar({
           </div>
         ) : (
           conversations
-            .slice()
-            .reverse()
             .map((c) => (
               <div
                 key={c.id}
