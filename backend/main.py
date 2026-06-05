@@ -77,3 +77,32 @@ async def check_env():
         "service_key_prefix": (os.getenv("SUPABASE_SERVICE_KEY") or "")[:20],
         "anthropic_key_set": bool(os.getenv("ANTHROPIC_API_KEY")),
     }
+
+
+@app.get("/health/supabase-test")
+async def test_supabase():
+    from services.supabase_service import get_supabase, get_supabase_anon
+
+    service_error = None
+    anon_error = None
+    try:
+        sb = get_supabase()
+        sb.table("conversations").select("id").limit(1).execute()
+        service_ok = True
+    except Exception as e:
+        service_ok = False
+        service_error = str(e)
+
+    try:
+        get_supabase_anon()
+        anon_ok = True
+    except Exception as e:
+        anon_ok = False
+        anon_error = str(e)
+
+    return {
+        "service_client": service_ok,
+        "service_error": service_error if not service_ok else None,
+        "anon_client": anon_ok,
+        "anon_error": anon_error if not anon_ok else None,
+    }
