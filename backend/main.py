@@ -64,3 +64,16 @@ def health(): return {"status": "ok"}
 def health_supabase():
     """DNS + HTTPS probe for Supabase (hostname only; no keys returned)."""
     return supabase_connectivity_report()
+
+
+@app.get("/health/env")
+async def check_env():
+    return {
+        "supabase_url_set": bool(os.getenv("SUPABASE_URL")),
+        "supabase_url_prefix": (os.getenv("SUPABASE_URL") or "")[:30],
+        "anon_key_set": bool(os.getenv("SUPABASE_ANON_KEY")),
+        "anon_key_prefix": (os.getenv("SUPABASE_ANON_KEY") or "")[:20],
+        "service_key_set": bool(os.getenv("SUPABASE_SERVICE_KEY")),
+        "service_key_prefix": (os.getenv("SUPABASE_SERVICE_KEY") or "")[:20],
+        "anthropic_key_set": bool(os.getenv("ANTHROPIC_API_KEY")),
+    }
