@@ -20,22 +20,24 @@ function sortGrades(grades) {
 
 function GradePanel({ g }) {
   const gradeTotal = Number(g.n || 0)
-  const anyFlagN = Math.round((Number(g.flagged_pct || 0) / 100) * gradeTotal)
-  const allThreeRow = (g.indicators || []).find((x) => x.name === 'All 3 flags')
-  const allThreeN = Number(allThreeRow?.count || 0)
+  const twoOrMoreN = Number(g.two_plus_count || 0)
+  const allThreeN = Number(g.all_three_count || 0)
+  const twoOrMorePct = gradeTotal > 0 ? Math.round((twoOrMoreN / gradeTotal) * 100) : 0
   const allThreePct = gradeTotal > 0 ? Math.round((allThreeN / gradeTotal) * 100) : 0
-  const noFlagN = gradeTotal - anyFlagN
+  const combos = g.combinations || {}
+  const flagged = Object.values(combos).reduce((sum, v) => sum + (Number(v) || 0), 0)
+  const flaggedPct = gradeTotal > 0 ? Math.round((flagged / gradeTotal) * 100) : 0
+  const noFlagN = gradeTotal - flagged
   const noFlagPct = gradeTotal > 0 ? Math.round((noFlagN / gradeTotal) * 100) : 0
-  const anyFlagPct = gradeTotal > 0 ? Math.round((anyFlagN / gradeTotal) * 100) : 0
 
   return (
     <>
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 8, marginBottom: 12 }}>
         {[
-          { label: 'Students', val: gradeTotal, sub: 'enrolled', color: '#2A3B7C' },
-          { label: 'Any flag', val: anyFlagN, sub: `${anyFlagPct}% of grade`, color: '#b7791f' },
-          { label: 'All 3 flags', val: allThreeN, sub: `${allThreePct}% of grade`, color: '#c53030' },
-          { label: 'No flags', val: noFlagN, sub: `${noFlagPct}% of grade`, color: '#276749' },
+          { label: 'Students',   val: gradeTotal,  sub: 'enrolled',              color: '#2A3B7C' },
+          { label: 'Any flag',   val: flagged,     sub: `${flaggedPct}% of grade`, color: '#b7791f' },
+          { label: 'All 3 flags',val: allThreeN,   sub: `${allThreePct}% of grade`,color: '#c53030' },
+          { label: 'No flags',   val: noFlagN,     sub: `${noFlagPct}% of grade`, color: '#276749' },
         ].map((t, ti) => (
           <div key={ti} style={{ background: '#f7f9fc', borderRadius: 8, padding: '8px 10px' }}>
             <div style={{ fontSize: 10, color: '#7a89b8', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 3 }}>{t.label}</div>
@@ -68,16 +70,43 @@ function GradePanel({ g }) {
         })}
       </div>
 
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
-        <div style={{ background: '#fffbeb', border: '1px solid #fbd38d', borderRadius: 8, padding: '8px 10px' }}>
-          <div style={{ fontSize: 11, color: '#b7791f', marginBottom: 3 }}>2 or more flags</div>
-          <div style={{ fontSize: 18, fontWeight: 700, color: '#b7791f' }}>{anyFlagN}</div>
-          <div style={{ fontSize: 10, color: '#b7791f' }}>{anyFlagPct}% of grade</div>
+      <div style={{ border: '1px solid #f0f3fa', borderRadius: 10, padding: 10 }}>
+        <div style={{ fontSize: 11, fontWeight: 600, color: '#7a89b8', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 10 }}>
+          Flag combinations
         </div>
-        <div style={{ background: '#fff5f5', border: '1px solid #fed7d7', borderRadius: 8, padding: '8px 10px' }}>
-          <div style={{ fontSize: 11, color: '#c53030', marginBottom: 3 }}>All 3 flags</div>
-          <div style={{ fontSize: 18, fontWeight: 700, color: '#c53030' }}>{allThreeN}</div>
-          <div style={{ fontSize: 10, color: '#c53030' }}>{allThreePct}% of grade</div>
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8, marginBottom: 10 }}>
+          <div style={{ background: '#fffbeb', border: '1px solid #fbd38d', borderRadius: 8, padding: '8px 10px' }}>
+            <div style={{ fontSize: 11, color: '#b7791f', marginBottom: 3 }}>2 or more flags</div>
+            <div style={{ fontSize: 18, fontWeight: 700, color: '#b7791f' }}>{twoOrMoreN}</div>
+            <div style={{ fontSize: 10, color: '#b7791f' }}>{twoOrMorePct}% of grade</div>
+          </div>
+          <div style={{ background: '#fff5f5', border: '1px solid #fed7d7', borderRadius: 8, padding: '8px 10px' }}>
+            <div style={{ fontSize: 11, color: '#c53030', marginBottom: 3 }}>All 3 flags</div>
+            <div style={{ fontSize: 18, fontWeight: 700, color: '#c53030' }}>{allThreeN}</div>
+            <div style={{ fontSize: 10, color: '#c53030' }}>{allThreePct}% of grade</div>
+          </div>
+        </div>
+        <div style={{ marginTop: 10 }}>
+          {[
+            { label: 'Absence + Academic',  key: 'absent_academic' },
+            { label: 'Absence + Behavior',  key: 'absent_behavior' },
+            { label: 'Behavior + Academic', key: 'behavior_academic' },
+          ].filter(({ key }) => (combos[key] || 0) > 0)
+           .map(({ label, key }) => {
+            const count = combos[key]
+            const pct = gradeTotal > 0 ? Math.round((count / gradeTotal) * 100) : 0
+            return (
+              <div key={key} style={{ marginBottom: 8 }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12, marginBottom: 4 }}>
+                  <span style={{ fontWeight: 600, color: '#2A3B7C' }}>{label}</span>
+                  <span style={{ color: '#2A3B7C' }}>{count} ({pct}%)</span>
+                </div>
+                <div style={{ height: 7, background: '#eef2f8', borderRadius: 999 }}>
+                  <div style={{ width: `${Math.min(100, pct)}%`, height: '100%', borderRadius: 999, background: '#2A3B7C', opacity: 0.6 }} />
+                </div>
+              </div>
+            )
+          })}
         </div>
       </div>
     </>

@@ -177,6 +177,7 @@ export default function MainApp({ session }) {
             artifactOpen={artifactOpen}
             onAddToReport={handleAddToReport}
             onAddToNotes={handleAddToNotes}
+            noteItems={noteItems}
             chatSessionKey={chatSessionKey}
             openConversationId={openConversationId}
             onConversationHighlight={setHighlightConversationId}

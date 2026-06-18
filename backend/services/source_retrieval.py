@@ -136,7 +136,7 @@ async def gather_sources(
     kb_scope: Optional[str] = None,
     *,
     internal: bool = False,
-    top_k: int = 3,
+    top_k: int = 5,
 ) -> dict[str, Any]:
     """
     Load KB documents and optional prefetched web URLs according to enabled scopes.

@@ -167,10 +167,10 @@ export default function CriteriaSettingCard({ data, onConfirm }) {
     return (
       <div style={{ border: '1px solid #e4e9f2', borderRadius: 10, padding: '10px 14px', background: '#f7f9fc', fontSize: 12 }}>
         <div style={{ fontWeight: 600, color: '#2A3B7C', marginBottom: 4 }}>✓ Indicator criteria set</div>
-        <div style={{ color: '#7a89b8', lineHeight: 1.5 }}>
+        <div style={{ fontSize: 11, color: '#7a89b8' }}>
           Chronic absence ≥{criteria.chronicPct}%
           {hasBehavior && ` · Suspensions ≥${criteria.suspensionMin}`}
-          {hasAcademic && ` · ${criteria.courseRules.length} course column${criteria.courseRules.length === 1 ? '' : 's'} checked`}
+          {hasAcademic && ` · ${ACADEMIC_PRESETS.find(p => p.value === criteria.academicPreset)?.label || 'Fail ≥1 course'} (${criteria.courseRules.map(r => r.label).join(', ')})`}
         </div>
       </div>
     )

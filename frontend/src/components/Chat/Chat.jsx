@@ -239,15 +239,14 @@ function buildGradesFromSummary(gradeSummary, schoolTotal = 0) {
       label: `Grade ${label}`,
       n: gradeTotal,
       flagged_pct: Number(g.two_plus_pct || 0),
+      two_plus_count: Number(g.two_plus_count || 0),
+      all_three_count: allThreeN,
+      combinations: g.combinations || {},
       indicators: [
         { name: 'Academic failure', count: Number(g.failing_count || 0), pct: Number(g.failing_pct || 0) },
         { name: 'Chronic absence', count: Number(g.absent_count || 0), pct: Number(g.absent_pct || 0) },
         { name: 'Suspensions', count: Number(g.suspended_count || 0), pct: Number(g.suspended_pct || 0) },
-        {
-          name: 'All 3 flags',
-          count: allThreeN,
-          pct: gradeTotal > 0 ? Math.round((allThreeN / gradeTotal) * 100) : 0,
-        },
+        { name: 'All 3 flags', count: allThreeN, pct: gradeTotal > 0 ? Math.round((allThreeN / gradeTotal) * 100) : 0 },
       ],
     }
   })
@@ -543,6 +542,7 @@ export default function Chat({
   artifactOpen,
   onAddToReport,
   onAddToNotes,
+  noteItems = [],
   chatSessionKey = 0,
   openConversationId = null,
   onConversationHighlight,
@@ -1161,9 +1161,9 @@ If the list is empty say so in one sentence. No bullet points, no tables, no stu
         { stripMarkdownTables: true },
       )
       patchLastAssistantActionPills([
-        { label: 'Action plan', type: 'artifact', artifact_type: 'action_plan' },
         { label: 'Brainstorm interventions', type: 'chat', text: 'What interventions would you recommend for these students?' },
-        { label: 'Subgroup breakdown', type: 'subgroup' },
+        { label: 'Well-being analysis', type: 'sel' },
+        { label: 'Grade breakdown', type: 'grade_breakdown' },
       ])
       return { result, studentsMeta, qf, mapping: fd.mapping }
     } catch (e) {
@@ -1408,9 +1408,17 @@ If the list is empty say so in one sentence. No bullet points, no tables, no stu
     if (!fd) return
     const { file_id, mapping } = fd
     let merged = null
+    let previousThresholds = null
     onAnalysisReady((prev) => {
-      merged = { ...(prev?.thresholds || {}), ...newPartial }
-      const next = { ...(prev || {}), thresholds: merged, file_id, mapping }
+      previousThresholds = prev?.thresholds || {}
+      merged = { ...previousThresholds, ...newPartial }
+      const next = {
+        ...(prev || {}),
+        thresholds: merged,
+        previous_thresholds: previousThresholds,
+        file_id,
+        mapping,
+      }
       delete next.students
       return next
     })
@@ -1503,7 +1511,20 @@ If the list is empty say so in one sentence. No bullet points, no tables, no stu
     }
     if (type === 'agenda' || type === 'report') {
       const userMsg = focus != null && String(focus).trim() !== '' ? String(focus).trim() : null
-      return { ...baseTrim, ...(ac.thresholds && { thresholds: ac.thresholds }), ...(userMsg && { focus_group: userMsg, user_message: userMsg }) }
+      const notesText = (noteItems || [])
+        .map(n => String(n.text || n.content || n.title || '').trim())
+        .filter(Boolean)
+        .join('\n---\n')
+      return {
+        ...baseTrim,
+        ...(ac.thresholds && { thresholds: ac.thresholds }),
+        ...(userMsg && { focus_group: userMsg, user_message: userMsg }),
+        ...(notesText && { selected_notes: notesText }),
+        artifact_chat_history: historyRef.current.map(m => ({
+          role: m.role,
+          content: String(m.content || '').slice(0, 500),
+        })),
+      }
     }
     return ac
   }
@@ -1724,7 +1745,7 @@ If the list is empty say so in one sentence. No bullet points, no tables, no stu
           role: 'card',
           type: 'data_confirm',
           data: { ...result, intent: intentRef.current },
-          onConfirm: (mapping, columnMetadata) => handleConfirm(result.file_id, mapping, columnMetadata || result.column_metadata || {}),
+          onConfirm: (mapping, columnMetadata, disabledColumns) => handleConfirm(result.file_id, mapping, columnMetadata || result.column_metadata || {}, disabledColumns || []),
         },
       ])
 
@@ -1741,15 +1762,29 @@ If the list is empty say so in one sentence. No bullet points, no tables, no stu
 
   // ── After DataConfirmCard: run unified foundational analysis ─────────────
 
-  async function handleConfirm(fid, confirmedMapping, columnMetadata = {}) {
-    // Merge confirmed mapping with the full original mapping to restore
-    // sel_factors, race_indicators etc that DataConfirmCard may have hidden
+  async function handleConfirm(fid, confirmedMapping, columnMetadata = {}, disabledColumns = []) {
     const fullMapping = fullMappingRef.current || {}
     const mergedMapping = {
-      ...fullMapping,        // start with everything Claude detected
-      ...confirmedMapping,   // overlay teacher's confirmed choices (these win)
+      ...fullMapping,
+      ...confirmedMapping,
       _column_metadata: columnMetadata,
     }
+
+    // Null out any roles whose column was toggled off
+    for (const [role, col] of Object.entries(fullMapping)) {
+      if (role.startsWith('_') || role === 'sel_factors' || role === 'race_indicators' || role === 'text_columns') continue
+      if (typeof col === 'string' && disabledColumns.includes(col)) {
+        mergedMapping[role] = null
+      }
+    }
+    // Also filter list roles
+    if (Array.isArray(mergedMapping.race_indicators)) {
+      mergedMapping.race_indicators = mergedMapping.race_indicators.filter(c => !disabledColumns.includes(c))
+    }
+    if (Array.isArray(mergedMapping.sel_factors)) {
+      mergedMapping.sel_factors = mergedMapping.sel_factors.filter(c => !disabledColumns.includes(c))
+    }
+
     fileDataRef.current = { file_id: fid, mapping: mergedMapping }
     persistFileSession(fid, mergedMapping)
 
@@ -1896,14 +1931,14 @@ If the list is empty say so in one sentence. No bullet points, no tables, no stu
       ])
 
       await appendAssistantStream(
-        `The school overview card above already shows total counts, indicator rates, and flag combinations. Do NOT repeat those numbers in a table or list.
+        `The school overview card above already shows the numbers — do not repeat them in a list or table.
 
-Write exactly 3 sentences in this order:
-1. The dominant risk indicator school-wide — name it, give the count and percentage from risk.indicators.
-2. The grade with the highest compounding risk — name the grade, cite its two-plus flag rate or all-three count from risk.grade_summary.
-3. One positive signal — the indicator with the lowest rate or the fact that most students have no flags.
+Write exactly 3 sentences:
+1. Which indicator stands out most and why a teacher should pay attention to it — name it, give count and % from risk.indicators.
+2. Which flag combination is most common (from risk.overlap.combinations) and what it suggests about how risks cluster together.
+3. One concrete next step a teacher can take based on what the card shows — e.g. look at grade breakdown, run subgroup analysis, or pull the student list.
 
-Plain prose only. No bullet points. No headers. No markdown tables. No mention of Stage 2 or intersection analysis.`,
+Plain prose only. No bullet points. No headers. No markdown tables.`,
         { risk, thresholds: risk.thresholds_used ?? t },
         { attachToLastWithViz: true },
       )
@@ -2670,7 +2705,14 @@ Plain prose only. No bullet points. No tables. No numbers already shown above.`,
     if (!gradeViz) return
     setMessages((prev) => [...prev, { role: 'assistant', content: '', sources: [], viz: gradeViz }])
     await appendAssistantStream(
-      'The grade breakdown card above already shows per-grade tiles and bars. Write exactly 2-3 short sentences grounded ONLY in grade_summary / grades in CURRENT ANALYSIS DATA. Name the specific grade(s) with highest risk and cite 2-3 real numbers from the data (counts or percentages for two-plus flags, chronic absence, academic failure, or all-three flags). Compare grades directly (e.g. Grade 6 vs Grade 7) — not a vague school-wide essay. Do not speculate about causes (e.g. students "catching up" a year later) unless the data clearly show it. Do not cite research or knowledge-base sources. No markdown tables.',
+      `The grade breakdown card above already shows per-grade numbers — do not repeat them in a list or table.
+
+Write exactly 3 sentences:
+1. Which grade has higher overall risk — compare the two grades directly on any flag count or two-plus flag rate from grade_summary.
+2. Which indicator drives the difference — name the specific indicator (academic failure, chronic absence, or suspensions) that is most different between grades, with the actual counts or percentages.
+3. One concrete next step based on the higher-risk grade — e.g. run subgroup analysis for that grade, pull the student list, or look at SEL scores.
+
+Only use numbers from grade_summary in CURRENT ANALYSIS DATA. Plain prose only. No bullet points. No markdown tables.`,
       { risk, grade_summary: risk?.grade_summary, grades: gradeViz.grades },
       { attachToLastWithViz: true },
     )
@@ -2682,8 +2724,9 @@ Plain prose only. No bullet points. No tables. No numbers already shown above.`,
     )
     const gradeNum = topGrade?.label?.replace('Grade ', '') || ''
     patchLastAssistantActionPills([
-      { label: 'Subgroup analysis', type: 'subgroup_grade', grade: gradeNum },
-      { label: 'Student list', type: 'student_list', tier: 'triple', grade: gradeNum },
+      { label: `Grade ${gradeNum} subgroup`, type: 'subgroup_grade', grade: gradeNum },
+      { label: 'School-wide subgroup', type: 'subgroup' },
+      { label: `Grade ${gradeNum} student list`, type: 'student_list', tier: 'triple', grade: gradeNum },
       { label: 'Well-being analysis', type: 'sel' },
     ])
   }
@@ -2815,6 +2858,143 @@ Plain prose only. No bullet points. No tables. No numbers already shown above.`,
       confidence: 1.0,
       outputs: [{ type: 'sel', filters: selFilters }],
     }
+  }
+
+  function buildInterventionClarifySteps() {
+    const r = analysisContext?.risk
+    const indicators = r?.indicators || {}
+    const academicPct = indicators.academic?.pct || 0
+    const absencePct = indicators.attendance?.pct || 0
+    const behaviorPct = indicators.behavior?.pct || 0
+    const hasSEL = Boolean(analysisContext?.sel?.available)
+
+    const steps = []
+    const dominantIndicators = [
+      { id: 'academics', label: 'Academics (course failures)', pct: academicPct },
+      { id: 'attendance', label: 'Attendance (chronic absence)', pct: absencePct },
+      { id: 'behavior', label: 'Behavior (suspensions)', pct: behaviorPct },
+    ].filter(i => i.pct > 0).sort((a, b) => b.pct - a.pct)
+
+    const hasClearDominant = dominantIndicators[0]?.pct > 20 &&
+      dominantIndicators[0]?.pct > (dominantIndicators[1]?.pct || 0) * 1.5
+
+    if (!hasClearDominant) {
+      steps.push({
+        id: 'focus',
+        title: 'What are we brainstorming interventions for?',
+        multi: true,
+        options: [
+          { id: 'academics', label: 'Academics (course failures / low skills)' },
+          { id: 'attendance', label: 'Attendance (chronic absence / tardies)' },
+          { id: 'behavior', label: 'Behavior (incidents / suspensions)' },
+          ...(hasSEL ? [{ id: 'sel', label: 'SEL / belonging & relationships' }] : []),
+          { id: 'family', label: 'Family engagement' },
+        ],
+      })
+    }
+
+    steps.push({
+      id: 'tier',
+      title: 'What tier/scope should interventions focus on?',
+      multi: false,
+      options: [
+        { id: 'tier1', label: 'Tier 1 — universal routines & messaging' },
+        { id: 'tier2', label: 'Tier 2 — targeted students: at-risk / near-chronic' },
+        { id: 'tier3', label: 'Tier 3 — intensive: highest-risk students' },
+        { id: 'tier1_2', label: 'Mix of Tier 1 + Tier 2' },
+        { id: 'tier2_3', label: 'Mix of Tier 2 + Tier 3' },
+      ],
+    })
+
+    steps.push({
+      id: 'setting',
+      title: 'What setting or approach?',
+      multi: true,
+      options: [
+        { id: 'classroom', label: 'Classroom-level strategies' },
+        { id: 'school', label: 'School-wide programs' },
+        { id: 'family', label: 'Family outreach & engagement' },
+        { id: 'community', label: 'Community partnerships' },
+        { id: 'counseling', label: 'Counseling / SEL support' },
+      ],
+    })
+
+    return steps
+  }
+
+  async function handleInterventionBrainstorm(originalText) {
+    const steps = buildInterventionClarifySteps()
+    const r = analysisContext?.risk
+    const indicators = r?.indicators || {}
+    const academicPct = indicators.academic?.pct || 0
+    const absencePct = indicators.attendance?.pct || 0
+    const behaviorPct = indicators.behavior?.pct || 0
+
+    const dominantIndicators = [
+      { id: 'academics', pct: academicPct },
+      { id: 'attendance', pct: absencePct },
+      { id: 'behavior', pct: behaviorPct },
+    ].filter(i => i.pct > 0).sort((a, b) => b.pct - a.pct)
+
+    const hasClearDominant = dominantIndicators[0]?.pct > 20 &&
+      dominantIndicators[0]?.pct > (dominantIndicators[1]?.pct || 0) * 1.5
+
+    const intro = hasClearDominant
+      ? `I can see ${dominantIndicators[0].id} is the dominant concern (${dominantIndicators[0].pct}%). Let me ask a couple of quick questions to tailor the interventions.`
+      : `Let me ask a few quick questions to tailor the interventions to your school's needs.`
+
+    setMessages(prev => [
+      ...prev,
+      {
+        role: 'assistant',
+        content: intro,
+        sources: [],
+      },
+      {
+        role: 'card',
+        type: 'clarify_wizard',
+        data: { intro, steps, originalMessage: originalText },
+        onComplete: (selections) => {
+          void handleInterventionClarifyResolved(originalText, selections)
+        },
+        onSkip: () => {
+          void appendAssistantStream(
+            `The teacher wants to brainstorm interventions: "${originalText}". Search the knowledge base and provide evidence-based intervention strategies relevant to this school's data.`,
+            analysisContext,
+            { kbScope: 'student_success' },
+          )
+        },
+      },
+    ])
+    pushHistory('assistant', intro)
+  }
+
+  async function handleInterventionClarifyResolved(originalText, selections) {
+    setMessages(prev => prev.filter(m => m.type !== 'clarify_wizard'))
+
+    const lines = (selections || [])
+      .filter(s => s.labels?.length)
+      .map(s => `${s.stepTitle}: ${s.labels.join(', ')}`)
+
+    const r = analysisContext?.risk
+    const indicators = r?.indicators || {}
+
+    const prompt = `A teacher is brainstorming interventions with the following focus:
+${lines.map(l => `- ${l}`).join('\n')}
+
+School context:
+- Total students: ${r?.total ?? 'unknown'}
+- Academic failure: ${indicators.academic?.count ?? 0} students (${indicators.academic?.pct ?? 0}%)
+- Chronic absence: ${indicators.attendance?.count ?? 0} students (${indicators.attendance?.pct ?? 0}%)
+- Suspensions: ${indicators.behavior?.count ?? 0} students (${indicators.behavior?.pct ?? 0}%)
+
+Search the knowledge base and provide 3-5 specific, evidence-based intervention strategies that match the teacher's focus and tier selection. For each strategy include: what it is, who it targets, and one concrete first action to implement it. Keep it practical and teacher-friendly.`
+
+    await appendAssistantStream(
+      prompt,
+      analysisContext,
+      { kbScope: 'student_success' },
+    )
   }
 
   function showClarifyWizard(originalMessage, intent) {
@@ -3078,6 +3258,12 @@ Plain prose only. No bullet points. No tables. No numbers already shown above.`,
       pushHistory('user', text)
     }
 
+    const isBrainstorm = /brainstorm|intervention|strategies|what (can|should) (i|we) do|how (can|do) (i|we) (support|help)|what (works|helps)/i.test(text)
+    if (isBrainstorm && hasUploadedData()) {
+      await handleInterventionBrainstorm(text)
+      return
+    }
+
     // Enrich short affirmative responses with last assistant context
     // so classifier knows what "yes/sure/ok" refers to
     const isAffirmative = /^(yes|sure|ok|okay|please|go ahead|do it|yep|yeah)\.?$/i.test(text.trim())
@@ -3216,24 +3402,9 @@ Use the upload button below — I'll map your columns and walk you through the c
     if (text === 'Brainstorm interventions') {
       intentRef.current = null
       intentRef._setByStarter = false
-      setMessages((prev) => [
-        ...prev,
-        { role: 'user', content: text },
-        {
-          role: 'assistant',
-          content: `I can help brainstorm intervention strategies. What's the main challenge you're working on?`,
-          sources: [],
-          suggestions: [
-            'Chronic absenteeism — students missing 10%+ of days',
-            'Course failures — students failing one or more subjects',
-            'Suspensions and behavioral incidents',
-            'Low school connectedness or adult support scores',
-            'Students with multiple risk flags',
-          ],
-          isAnalysisMessage: true,
-        },
-      ])
+      setMessages((prev) => [...prev, { role: 'user', content: text }])
       pushHistory('user', text)
+      void handleInterventionBrainstorm(text)
       return
     }
 

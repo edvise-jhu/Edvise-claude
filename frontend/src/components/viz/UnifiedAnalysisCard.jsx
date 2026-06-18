@@ -1,8 +1,9 @@
 export default function UnifiedAnalysisCard({ data }) {
   const indicators = Array.isArray(data?.indicators) ? data.indicators : []
-  const total      = Number(data?.summary?.total_students || 0)
-  const flagged    = Number(data?.summary?.total_flagged  || 0)
-  const flaggedPct = Number(data?.summary?.flagged_pct    || 0)
+  const total      = Number(data?.total || data?.summary?.total_students || 0)
+  const combos     = data?.overlap?.combinations || {}
+  const flagged    = Object.values(combos).reduce((sum, v) => sum + (Number(v) || 0), 0)
+  const flaggedPct = total > 0 ? Math.round((flagged / total) * 1000) / 10 : 0
   const noFlags    = total - flagged
 
   return (
@@ -82,21 +83,27 @@ export default function UnifiedAnalysisCard({ data }) {
               </div>
             </div>
 
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6 }}>
+            <div style={{ marginTop: 10 }}>
               {[
-                { label: 'Absence only',          key: 'absent_only' },
-                { label: 'Behavior only',         key: 'behavior_only' },
-                { label: 'Academic failure only', key: 'academic_only' },
-                { label: 'Absence + Academic',    key: 'absent_academic' },
-                { label: 'Absence + Behavior',    key: 'absent_behavior' },
-                { label: 'Behavior + Academic',   key: 'behavior_academic' },
+                { label: 'Absence + Academic',  key: 'absent_academic' },
+                { label: 'Absence + Behavior',  key: 'absent_behavior' },
+                { label: 'Behavior + Academic', key: 'behavior_academic' },
               ].filter(({ key }) => (data.overlap.combinations?.[key] || 0) > 0)
-               .map(({ label, key }) => (
-                <div key={key} style={{ fontSize: 12, color: '#4a5568', display: 'flex', justifyContent: 'space-between', padding: '3px 0', borderBottom: '1px solid #f0f3fa' }}>
-                  <span>{label}</span>
-                  <span style={{ fontWeight: 600, color: '#2A3B7C' }}>{data.overlap.combinations[key]}</span>
-                </div>
-              ))}
+               .map(({ label, key }) => {
+                const count = data.overlap.combinations[key]
+                const pct = total > 0 ? Math.round((count / total) * 100) : 0
+                return (
+                  <div key={key} style={{ marginBottom: 8 }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12, marginBottom: 4 }}>
+                      <span style={{ fontWeight: 600, color: '#2A3B7C' }}>{label}</span>
+                      <span style={{ color: '#2A3B7C' }}>{count} ({pct}%)</span>
+                    </div>
+                    <div style={{ height: 7, background: '#eef2f8', borderRadius: 999 }}>
+                      <div style={{ width: `${Math.min(100, pct)}%`, height: '100%', borderRadius: 999, background: '#2A3B7C', opacity: 0.6 }} />
+                    </div>
+                  </div>
+                )
+              })}
             </div>
           </div>
         )}

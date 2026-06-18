@@ -119,18 +119,22 @@ def get_supabase_anon() -> Client:
 
 
 async def get_current_user(authorization: Optional[str] = Header(None)) -> dict:
-    """Verify JWT and return user profile."""
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing or invalid authorization header")
 
     token = authorization.split(" ")[1]
-    supabase = get_supabase_anon()
 
     try:
-        user = supabase.auth.get_user(token)
-        if not user or not user.user:
+        supabase = get_supabase()
+        response = supabase.auth.get_user(token)
+        if not response or not response.user:
             raise HTTPException(status_code=401, detail="Invalid token")
-        return {"id": user.user.id, "email": user.user.email}
+        return {
+            "id": response.user.id,
+            "email": response.user.email,
+        }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=401, detail=f"Auth error: {str(e)}")
 

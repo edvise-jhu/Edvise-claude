@@ -312,7 +312,23 @@ export default function ArtifactPanel({
                     style={{ padding: '8px 10px', border: '1px solid #10B98133', background: '#f0fdf4', borderRadius: 8, cursor: 'pointer', fontSize: 12, fontWeight: 500, color: '#15803d', display: 'flex', alignItems: 'center', gap: 6, fontFamily: 'inherit' }}>
                     📋 Create Action Plan
                   </button>
-                  <button type="button" onClick={() => { setActiveTab('agenda'); handleGenerate() }}
+                  <button type="button" onClick={() => {
+                    setActiveTab('agenda')
+                    const notesText = noteItems.map(n => String(n.content || n.text || '')).filter(Boolean).join('\n---\n')
+                    setLoading(true)
+                    setError(null)
+                    generateArtifact('agenda', {
+                      ...(analysisContext || {}),
+                      selected_notes: notesText || null,
+                      note_items: noteItems.map(n => n.content),
+                    }, null, accessToken)
+                      .then(result => {
+                        if (result.error) throw new Error(result.error)
+                        setArtifacts(prev => ({ ...prev, agenda: result }))
+                      })
+                      .catch(e => setError(e.message))
+                      .finally(() => setLoading(false))
+                  }}
                     style={{ padding: '8px 10px', border: '1px solid #3E94A533', background: '#f0f8fb', borderRadius: 8, cursor: 'pointer', fontSize: 12, fontWeight: 500, color: '#1b6070', display: 'flex', alignItems: 'center', gap: 6, fontFamily: 'inherit' }}>
                     📅 Create Agenda
                   </button>

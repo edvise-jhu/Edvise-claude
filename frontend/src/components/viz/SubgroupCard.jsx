@@ -120,14 +120,14 @@ function GroupAccordion({
         <div style={{ fontSize: 11, color: '#7a89b8', minWidth: 56 }}>
           n = {group.n.toLocaleString()}
         </div>
-        {isSchoolWide ? (
-          <div style={{ flex: 1, display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
-            {displayMetrics.map((m) => {
-              const pct = metricPct(group, m)
-              return (
-                <MetricPill key={m.field} label={m.label} pct={pct} highlight={pct > 30} />
-              )
-            })}
+        {(isSchoolWide || isGradeSubgroup) ? (
+          <div style={{ flex: 1, display: 'flex', alignItems: 'center', gap: 8 }}>
+            <div style={{ flex: 1, maxWidth: 160, background: '#f0f3fa', borderRadius: 3, height: 7, overflow: 'hidden' }}>
+              <div style={{ width: `${Math.min(100, group.flagged_pct || 0)}%`, height: '100%', borderRadius: 3, background: isHighRisk ? '#DC2626' : '#3E94A5' }} />
+            </div>
+            <span style={{ fontSize: 12, fontWeight: 600, color: isHighRisk ? '#DC2626' : '#2A3B7C' }}>
+              {group.flagged_pct ?? 0}% flagged
+            </span>
           </div>
         ) : (
           <div style={{ flex: 1, display: 'flex', alignItems: 'center', gap: 8 }}>
@@ -149,17 +149,28 @@ function GroupAccordion({
       {isOpen && (
         <div style={{ padding: '0 14px 12px', borderTop: '1px solid #e4e9f2' }}>
           <div style={{ marginTop: 10, border: '1px solid #e4e9f2', borderRadius: 8, overflow: 'hidden' }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', padding: '7px 10px', background: '#f7f9fc', borderBottom: '1px solid #e4e9f2' }}>
-              <div style={{ fontSize: 12, fontWeight: 600, color: '#2A3B7C' }}>Single flag only</div>
-              <div style={{ fontSize: 12, fontWeight: 600, color: '#2A3B7C', fontFamily: 'monospace' }}>
-                {(group.single_flags || []).reduce((s, r) => s + r.count, 0)} · {(group.single_flags || []).reduce((s, r) => s + r.pct, 0).toFixed(1)}%
-              </div>
+            <div style={{ padding: '7px 10px', background: '#f7f9fc', borderBottom: '1px solid #e4e9f2' }}>
+              <div style={{ fontSize: 12, fontWeight: 600, color: '#2A3B7C' }}>Risk indicators (any students with each flag)</div>
             </div>
-            <ColHeader />
-            {group.single_flags?.length > 0
-              ? group.single_flags.map((row, i) => <FlagRow key={i} row={row} groupN={group.n} />)
-              : <div style={{ padding: '8px 10px', fontSize: 11, color: '#7a89b8' }}>None in this group</div>
-            }
+            {[
+              { label: 'Academic failure', count: group.academic_fail_count, pct: group.cohort_pct },
+              { label: 'Chronic absence', count: group.chronic_absent_count, pct: group.chronic_absent_pct },
+              { label: 'Suspensions', count: group.suspended_count, pct: group.suspended_pct },
+            ].map(({ label, count, pct }) => {
+              if (!count) return null
+              const barPct = group.n > 0 ? Math.min(100, (count / group.n) * 100) : 0
+              return (
+                <div key={label} style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '6px 10px', borderBottom: '1px solid #f9fafc' }}>
+                  <div style={{ width: 130, fontSize: 12, color: '#2A3B7C', fontWeight: 600, flexShrink: 0 }}>{label}</div>
+                  <div style={{ flex: 1, background: '#f0f3fa', borderRadius: 2, height: 8, overflow: 'hidden' }}>
+                    <div style={{ width: `${barPct}%`, height: '100%', background: '#3E94A5', borderRadius: 2 }} />
+                  </div>
+                  <div style={{ fontSize: 11, color: '#2A3B7C', fontFamily: 'monospace', width: 80, textAlign: 'right' }}>
+                    {count} · {pct}%
+                  </div>
+                </div>
+              )
+            })}
           </div>
 
           <div style={{ marginTop: 6, border: '1px solid #e4e9f2', borderRadius: 8, overflow: 'hidden' }}>

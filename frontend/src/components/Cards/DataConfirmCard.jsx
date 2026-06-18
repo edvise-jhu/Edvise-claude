@@ -44,19 +44,22 @@ export default function DataConfirmCard({ data, onConfirm }) {
     setIsConfirming(true)
     try {
       const confirmedNames = {}
+      const disabledColumns = []
       allCols.forEach(col => {
         if (columnState[col].enabled) {
           confirmedNames[col] = columnState[col].suggestedName
+        } else {
+          disabledColumns.push(col)
         }
       })
 
       const result = await confirmVariableNames(fileId, confirmedNames)
       setConfirmedMapping(result.suggested_mapping)
       setConfirmed(true)
-      onConfirm(result.suggested_mapping, result.column_metadata)
+      onConfirm(result.suggested_mapping, result.column_metadata, disabledColumns)
     } catch (e) {
       console.error('confirmVariableNames failed:', e)
-      onConfirm(data.suggested_mapping, metadata)
+      onConfirm(data.suggested_mapping, metadata, [])
     } finally {
       setIsConfirming(false)
     }

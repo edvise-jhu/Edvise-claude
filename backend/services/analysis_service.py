@@ -841,6 +841,15 @@ def run_unified_analysis(df: pd.DataFrame, mapping: dict, thresholds: dict = Non
                 "two_plus_count": int((grp["indicator_count"] >= 2).sum()),
                 "two_plus_pct": round((grp["indicator_count"] >= 2).mean() * 100, 1) if n else 0,
                 "all_three_count": int((grp["indicator_count"] == 3).sum()),
+                "combinations": {
+                    "absent_only":        int((grp["chronic_absent"] & ~grp["has_suspension"] & ~grp["has_academic_failure"]).sum()),
+                    "behavior_only":      int((grp["has_suspension"] & ~grp["chronic_absent"] & ~grp["has_academic_failure"]).sum()),
+                    "academic_only":      int((grp["has_academic_failure"] & ~grp["chronic_absent"] & ~grp["has_suspension"]).sum()),
+                    "absent_behavior":    int((grp["chronic_absent"] & grp["has_suspension"] & ~grp["has_academic_failure"]).sum()),
+                    "absent_academic":    int((grp["chronic_absent"] & grp["has_academic_failure"] & ~grp["has_suspension"]).sum()),
+                    "behavior_academic":  int((grp["has_suspension"] & grp["has_academic_failure"] & ~grp["chronic_absent"]).sum()),
+                    "all_three":          int((grp["indicator_count"] == 3).sum()),
+                },
             }
         result["grade_summary"] = grade_summary
 
