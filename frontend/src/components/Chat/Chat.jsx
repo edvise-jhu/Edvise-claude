@@ -2182,7 +2182,7 @@ Plain prose only. No bullet points. No headers. No markdown tables.`,
         thresholdsArg(),
         null,
         null,
-        { comparison_metric: metric, prior_list_context: priorListContext },
+        { comparison_metric: metric, prior_list_context: priorListContext || null },
         sourceText,
       )
 
@@ -2272,6 +2272,22 @@ Instructions:
         }])
       }
 
+      if (rowLevelPayload.mode === 'cohort_sample' && !record) {
+        setMessages(prev => [...prev, {
+          role: 'card',
+          type: 'student_table',
+          data: {
+            students: rowLevelPayload.records || [],
+            mapping: fd.mapping,
+            studentsMeta: {
+              total: rowLevelPayload.total,
+              shown: (rowLevelPayload.records || []).length,
+              truncated: rowLevelPayload.truncated,
+            },
+          },
+        }])
+      }
+
       const rowLevelPrompt = record
         ? `CRITICAL: Follow every rule below exactly. Do not deviate.
 
@@ -2291,51 +2307,25 @@ RULES — each violation is a bug:
 7. Never invent labels like "Not elevated", "Low", "Moderate".
 8. Write one intro sentence identifying the student and their grade before the data sections.
    Example: "Here is everything on record for Student 1001, currently in Grade 6."`
-        : `CRITICAL: Follow every rule below exactly. Do not deviate.
+        : `The teacher asked: "${sourceText}"
 
-The teacher asked: "${sourceText}"
-${rowLevelPayload.truncated
-  ? `row_level.records is a sample of ${rowLevelPayload.records?.length ?? 0} students; row_level.total is ${rowLevelPayload.total}. Aggregate (e.g. means by grade) from these values when needed.`
-  : 'Full dataset is in row_level.records.'}
+The filtered student records are in row_level.records. These are ALL students matching the query — not a sample.
 col_descriptions maps every column to its human-readable label.
 factor_labels maps SEL columns to friendly names.
+Total students in this filtered list: ${rowLevelPayload.total}.
+
+Write a 2-3 sentence plain prose summary of what the list shows:
+1. How many students match and what the key pattern is across the group.
+2. One notable finding specific to this group — a demographic concentration, a SEL pattern, or a risk combination that stands out.
+Do not list individual students by name or ID. Do not use bullet points. Do not mention "sample" or truncation. Do not reproduce the table.
 
 RULES:
 1. Every field label MUST come from col_descriptions[col]. Never use raw column names.
-2. Boolean values MUST be shown as Yes/No not true/false.
-3. Never show raw column names anywhere — not in parentheses, not in code blocks, not as part of explanations. Always use col_descriptions[col] for the label.
-   WRONG: "1 course failed (tot_crse_fail = 1)"
-   RIGHT: "1 course failed"
-4. Never invent labels like "Not elevated", "Low", "Moderate".
-5. For correlation questions:
-   - Output a scatter viz block showing the two variables.
-   - Write 2-3 sentences of interpretation using human-readable labels.
-   - Do NOT show the computation formula or method.
-   - Do NOT show a table of individual student values.
-   - Do NOT explain how Pearson r is calculated.
-6. For ranking questions (top/bottom N students):
-   - Output the ranked list as plain prose or a simple inline list.
-   - Do NOT render a full student table card.
-   - Use col_descriptions labels for all column names.
-7. Never write "How It Was Computed" or similar sections.
-8. When the teacher asks for a specific chart type, always use exactly that type.
-   If they ask for a radar chart, output a radar viz block — never substitute a bar chart.
-   Radar viz format:
-   \`\`\`viz
-   {
-     "type": "radar",
-     "title": "...",
-     "data": {
-       "labels": ["Factor 1", "Factor 2", ...],
-       "datasets": [
-         {"label": "Group A", "data": [3.4, 3.6, ...]},
-         {"label": "School average", "data": [3.7, 3.8, ...]}
-       ]
-     }
-   }
-   \`\`\`
-   datasets[].data must be flat arrays of numbers matching the labels length.
-   Labels must use factor_labels values, not raw column names.`
+2. Never show raw column names anywhere — not in parentheses, not in explanations.
+3. For correlation questions: output a scatter viz block. Write 2-3 sentences of interpretation. Do not show computation details or individual values.
+4. For ranking questions: output the ranked list as plain prose, top 10 only. Do not render a full table.
+5. When the teacher asks for a specific chart type, always use exactly that type.
+6. When the teacher asks for a radar chart, output type: radar. Never substitute a bar chart.`
 
       try {
         await appendAssistantStream(
@@ -3115,8 +3105,16 @@ Search the knowledge base and provide 3-5 specific, evidence-based intervention 
         `radar for multi-factor, doughnut for part-of-whole.\n` +
         `2. If the exact answer requires data not in loaded results AND the question is a ` +
         `data/computation question (counts, rates, comparisons): ` +
-        `output ONLY the single word NEEDS_COMPUTATION on its own line. ` +
-        `No explanation before it. No text after it. Just: NEEDS_COMPUTATION\n` +
+        `output ONLY this on its own line: NEEDS_COMPUTATION:<metric>\n` +
+        `where <metric> is one of: sel, absence, suspension, failure, indicators, students\n` +
+        `students = any question about specific students, filtering by conditions, or individual records\n` +
+        `sel = SEL factor scores or social-emotional comparisons\n` +
+        `absence = chronic absence or attendance rates\n` +
+        `suspension = suspension rates or behavior\n` +
+        `failure = course failure rates\n` +
+        `indicators = multiple risk indicators at once, or when unsure\n` +
+        `Example: NEEDS_COMPUTATION:sel or NEEDS_COMPUTATION:absence\n` +
+        `No explanation before it. No text after it.\n` +
         `NEVER output NEEDS_COMPUTATION for intervention, strategy, or "what should I do" questions.\n` +
         `3. Only use exact numbers from CURRENT ANALYSIS DATA. Never estimate. ` +
         `Only include positive demographic groups — exclude Non-ELL, No IEP etc. ` +
@@ -3129,7 +3127,13 @@ Search the knowledge base and provide 3-5 specific, evidence-based intervention 
         setMessages(prev => prev.filter(m => !m.content?.includes('NEEDS_COMPUTATION')))
         if (hasUploadedData()) {
           try {
-            await runCustomGroupComparison(text, 'indicators')
+            const ncMatch = result.content.match(/NEEDS_COMPUTATION:(\w+)/)
+            const needsCompMetric = ncMatch?.[1] || 'indicators'
+            if (needsCompMetric === 'students') {
+              await runRowLevelQuery(text)
+            } else {
+              await runCustomGroupComparison(text, needsCompMetric)
+            }
           } catch (e) {
             await appendAssistantStream(
               `The teacher asked: "${text}"\n\n` +

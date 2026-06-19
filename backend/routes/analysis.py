@@ -298,7 +298,7 @@ async def run_analysis(req: AnalysisRequest):
 
     # Pre-filter df using the teacher's natural-language message before routing to any
     # analysis function.  Skipped for stages that always need the full school view.
-    FULL_SCHOOL_STAGES = {"unified", "individual", "intersection", "row_level"}
+    FULL_SCHOOL_STAGES = {"unified", "individual", "intersection", "row_level", "group_comparison", "students"}
     if req.message and req.stage not in FULL_SCHOOL_STAGES:
         dynamic_filters = resolve_dynamic_filters(req.message, req.mapping, df)
         if dynamic_filters:
@@ -360,10 +360,15 @@ async def run_analysis(req: AnalysisRequest):
             df, req.mapping, req.thresholds, req.message or ''
         )
     elif req.stage == "students":
+        message_filters = {}
+        if req.message:
+            message_filters = resolve_dynamic_filters(req.message, req.mapping, df) or {}
+            print(f"[students] message_filters={message_filters}")
+            print(f"[students] df before filters={len(df)}")
         result = run_students_analysis(
             df,
             req.mapping,
-            req.filter_tier or "critical",
+            req.filter_tier or "all",
             req.thresholds,
             req.grade_filter,
             require_ell=bool(req.require_ell),
@@ -372,6 +377,7 @@ async def run_analysis(req: AnalysisRequest):
             min_suspension_count=req.min_suspension_count,
             min_course_failures=req.min_course_failures,
             sort_by=req.sort_by,
+            message_filters=message_filters,
         )
     else:
         raise HTTPException(status_code=400, detail=f"Unknown stage: {req.stage!r}")

@@ -1,7 +1,7 @@
 from fastapi import APIRouter, HTTPException, Header
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from typing import Optional
+from typing import Any, Optional, Union
 import json
 import logging
 import re
@@ -118,7 +118,7 @@ class IntentOutputModel(BaseModel):
     plan_variant: Optional[str] = None
     list_title: Optional[str] = None
     narrative_hint: Optional[str] = None
-    filters: Optional[IntentFiltersModel] = None
+    filters: Optional[Union[IntentFiltersModel, list[dict[str, Any]]]] = None
 
 
 class IntentClassifyResponse(BaseModel):
@@ -422,7 +422,22 @@ def _sanitize_one_output(raw: dict, default_grade: Optional[str] = None) -> Opti
         metric = str(raw.get("metric") or "flags").strip().lower()
         if metric not in ("sel", "absence", "failure", "suspension", "flags"):
             metric = "flags"
-        return {"type": "group_comparison", "metric": metric}
+        result = {"type": "group_comparison", "metric": metric}
+        raw_filters = raw.get("filters")
+        if isinstance(raw_filters, list) and raw_filters:
+            normalized = []
+            for f in raw_filters:
+                if not isinstance(f, dict):
+                    continue
+                clean = {}
+                for k, v in f.items():
+                    if k.startswith("non_"):
+                        clean[k[4:]] = 0
+                    else:
+                        clean[k] = v
+                normalized.append(clean)
+            result["filters"] = normalized
+        return result
     if otype == "row_level":
         return {"type": "row_level"}
     tier = raw.get("tier")
@@ -785,25 +800,37 @@ def _classify_teacher_intent(
         "STEP 2 — WHAT ACTION TO TAKE\n\n"
 
         "Use action=execute for:\n"
-        "A) Explicit run/show/view commands:\n"
+        "A) Row-level student queries — evaluate FIRST before anything else:\n"
+        "   Any question about students that combines multiple conditions, mixes positive\n"
+        "   and negative conditions, applies thresholds on raw columns, or cannot be\n"
+        "   expressed as a single tier or single demographic filter.\n"
+        "   Claude needs the raw records to answer these — route to row_level.\n"
+        "   If more than one condition is combined → row_level.\n"
+        "   If the question is about a specific student by ID → row_level.\n"
+        "   If the question ranks or correlates raw column values → row_level.\n\n"
+        "B) Explicit run/show/view commands:\n"
         "   - 'run foundational analysis', 'foundational analysis', 'run analysis' (without 'subgroup') → analysis, analysis_type=unified\n"
         "     NEVER route these to subgroup_school_wide or subgroup_picker.\n"
         "   - 'run subgroup analysis', 'show subgroup breakdown', 'view subgroup' → analysis, subgroup_school_wide\n"
         "   - 'run well-being analysis', 'run SEL analysis', 'show SEL' → sel\n"
         "   - 'view grade breakdown', 'show grade breakdown', 'grade breakdown' → analysis, grade_breakdown\n"
-        "   - 'show me students', 'student list', 'pull a list', 'who are the...' → student_list\n"
         "   - 'create action plan', 'build intervention plan', 'generate agenda', 'create report' → artifact\n\n"
-        "B) Any comparison or question where the exact answer is NOT already in loaded results:\n"
+        "C) Simple student list with a single tier or single demographic filter only:\n"
+        "   - 'show me triple-flag students' → student_list, tier=triple\n"
+        "   - 'show me Grade 7 students at risk' → student_list, grade=7\n"
+        "   - 'show me ELL students' → student_list, demographic_subset=ell\n"
+        "   ONLY use student_list when the filter is a single tier OR a single demographic.\n"
+        "   If more than one condition is combined → row_level instead.\n\n"
+        "D) Any comparison or question where the exact answer is NOT already in loaded results:\n"
         "   → group_comparison. Let resolve_custom_groups figure out the groups from the message.\n"
         "   This includes: grade vs grade, demographic vs demographic, cohort vs cohort,\n"
         "   threshold-based groups, any cross-tab not pre-computed.\n"
+        "   Grade comparisons on risk indicators ARE in grade_summary → action=chat.\n"
+        "   Grade comparisons on SEL factors are NOT pre-computed → group_comparison, metric=sel.\n"
+        "   Demographic comparisons on any metric are NOT pre-computed → group_comparison.\n"
         "   NEVER respond with 'I don't have that data' — always compute it.\n\n"
-        "C) Student list with filters:\n"
-        "   - 'show me Grade 7 students with all 3 flags', 'list ELL students who are failing' → student_list\n"
-        "   - 'which students X', 'which Grade 7 students have X' → student_list, NOT chat\n"
-        "   - 'which' + any student characteristic → always student_list\n"
-        "D) SEL subgroup comparisons:\n"
-        "   - 'do Low SES students score lower on SEL in Grade 7', 'compare ELL vs non-ELL SEL in Grade 6' → sel, sel_compare_dimension + sel_compare_grade\n"
+        "E) SEL subgroup comparisons:\n"
+        "   - 'compare ELL vs non-ELL SEL in Grade 7' → sel, sel_compare_dimension + sel_compare_grade\n"
         "   - 'compare triple-flag vs on-track on SEL' → sel, sel_cohort=triple, sel_baseline=school\n\n"
 
         "Use action=clarify ONLY when:\n"
@@ -831,8 +858,12 @@ def _classify_teacher_intent(
         "  - When multiple filters are needed that filters{} can't express, set tier=all and ensure the full message text is passed so resolve_dynamic_filters can extract all conditions\n"
         f"- analysis: analysis_type (unified|subgroup_school_wide|subgroup_triple_cohort|subgroup_grade_driver|grade_breakdown), subgroup_compare fields from: {field_glossary_for_prompt()}\n"
         "  unified = foundational risk overview. 'run foundational analysis' / 'run analysis' → unified, NEVER subgroup.\n"
-        "- row_level: ONLY for individual student profile, Pearson/Spearman correlation between "
-        "two raw columns, or top/bottom N students ranked by a single raw column value. "
+        "- row_level: ONLY for these three specific cases:\n"
+        "  1. Individual student profile by ID ('tell me about student 1001')\n"
+        "  2. Correlation between two raw columns ('correlate absences and failures')\n"
+        "  3. Top/bottom N students ranked by a single raw column ('who has the most absences')\n"
+        "  For ALL other student questions — any filter combination, any conditions, any demographics — use student_list.\n"
+        "  student_list handles everything: 'students with X but not Y', 'students with low SEL and high absence', any combination.\n\n"
         "If risk.grade_summary already contains the answer (grade rates, counts, overlaps), "
         "it is action=chat, never row_level.\n"
         "- sel: full SEL analysis card ONLY for these specific cases:\n"
@@ -850,7 +881,16 @@ def _classify_teacher_intent(
         "  metric=suspension for suspension/behavior questions\n"
         "  metric=failure for course failure/academic questions\n"
         "  metric=flags for questions about risk indicators, flags, or multiple indicators at once\n"
-        "  When multiple indicators are mentioned (e.g. absence AND suspension), use metric=flags\n\n"
+        "  When multiple indicators are mentioned (e.g. absence AND suspension), use metric=flags\n"
+        "  filters: when the teacher explicitly names two or more groups to compare, extract them.\n"
+        "  Each group is an object with any combination of: grade (int), demographic (string),\n"
+        "  tier (string). Let the message text determine the fields — never hardcode field names.\n"
+        "  Examples of extraction (generalize, do not match literally):\n"
+        "  - 'grade 6 vs grade 7' → filters: [{grade: 6}, {grade: 7}]\n"
+        "  - 'SPED vs non-SPED' → filters: [{demographic: 'special_ed'}, {demographic: 'non_special_ed'}]\n"
+        "  - 'triple-flag grade 7 vs on-track grade 6' → filters: [{tier: 'triple', grade: 7}, {tier: 'on_track', grade: 6}]\n"
+        "  - 'hispanic vs white students' → filters: [{demographic: 'hispanic'}, {demographic: 'white'}]\n"
+        "  If no explicit groups are named, set filters: null and resolve_custom_groups will infer from context.\n\n"
         "- artifact: artifact_type (action_plan|agenda|report)\n\n"
 
         "STEP 5 — SEL filters (when action=execute, type=sel)\n"
@@ -881,9 +921,14 @@ def _classify_teacher_intent(
         "  If it needs computation it is action=execute with answerable_from_context=false.\n\n"
 
         "ROUTING DECISION MATRIX (use this, not pattern matching on keywords):\n\n"
+        "0. Does the question compare SEL factors across two explicitly named grades or demographics?\n"
+        "   → ALWAYS action=execute, type=group_comparison, metric=sel, filters extracted from message.\n"
+        "   This applies even when sel.groups is loaded — sel.groups is broken down by risk tier,\n"
+        "   never by grade. Grade-level SEL comparisons always require new computation.\n"
+        "   Examples: 'grade 6 vs grade 7 SEL', 'compare SEL by grade', 'SEL factors by grade level'\n\n"
         "1. Is the answer already in risk.grade_summary, risk.indicators, risk.overlap, subgroup.categories, or sel.groups?\n"
         "   → action=chat, answerable_from_context=true\n"
-        "   This covers: grade comparisons, indicator rates, overlap counts, subgroup rates, SEL group averages.\n"
+        "   This covers: grade comparisons of risk indicators, overlap counts, subgroup rates, SEL group averages by risk tier.\n"
         "   Charts/visualizations of this data are also chat — Claude emits a viz block.\n"
         "   CRITICAL: Check context_summary before routing to execute:\n"
         "   - subgroup.categories present → 'which subgroups have highest X' is action=chat\n"
@@ -905,7 +950,12 @@ def _classify_teacher_intent(
         "   NOT for: grade comparisons, indicator rates, anything derivable from aggregates.\n\n"
         "4. Does the message name multiple options without choosing?\n"
         "   → action=clarify\n\n"
-        "5. Everything else (interventions, strategies, explanations, what to do next)?\n"
+        "5. Is the question about specific students, any combination of student conditions,\n"
+        "   or anything that requires filtering individual records?\n"
+        "   → action=execute, type=row_level\n"
+        "   This is the catch-all for any student-level question not handled above.\n\n"
+        "6. Everything else (interventions, strategies, explanations, what to do next,\n"
+        "   questions about school-wide context not requiring student records)?\n"
         "   → action=chat, answerable_from_context=true\n\n"
         "KB SCOPE RULE:\n"
         "Set kb_scope=student_success when the question asks about:\n"
@@ -913,6 +963,7 @@ def _classify_teacher_intent(
         "  - what to do about chronic absence, course failure, suspensions, low SEL scores\n"
         "  - evidence-based practices, research-backed methods\n"
         "  - how to support SPED, ELL, or other subgroups\n"
+        "  - SEL or well-being comparisons (stage=sel questions always use student_success)\n"
         "Set kb_scope=general for everything else (data questions, analysis requests, artifact generation).\n\n"
         "ARCHETYPES (one per route — generalize from these):\n"
         "chat+context: any rate/count/comparison question on loaded data, any chart of loaded data, "
@@ -922,8 +973,12 @@ def _classify_teacher_intent(
         "'show me a radar chart of SEL factors', 'SEL scores for chronically absent students', "
         "'chart the SEL factors by risk group', any request for a chart/visualization of SEL data "
         "when sel.groups is already loaded — answer from sel.groups in context, emit viz block\n"
-        "execute+student_list: 'show me students with X'\n"
-        "execute+row_level: 'which student has the highest X', 'correlate X and Y', 'student 1001s profile'\n"
+        "execute+row_level: 'which student has the highest X', 'correlate X and Y', 'student 1001s profile' — ONLY these three patterns\n"
+        "execute+student_list: everything else about students — 'who are students with X', 'show me students with high Y but low Z',\n"
+        "any filter combination, any conditions, demographics, SEL thresholds, negative conditions — always student_list\n"
+        "execute+group_comparison+sel: any question comparing SEL factors across two explicitly named groups "
+        "(grades, demographics, tiers) where sel.groups does not already contain the comparison — "
+        "→ group_comparison, metric=sel, filters extracted from the named groups in the message\n"
         "execute+sel: 'run SEL analysis', 'run well-being analysis', "
         "'compare ELL vs non-ELL SEL in Grade 7', "
         "'compare triple-flag vs on-track on SEL' — full SEL card only\n"
@@ -943,6 +998,7 @@ def _classify_teacher_intent(
         "tier: critical|high|moderate|on_track|all|triple|two_or_more|absent_academic|academic_only\n"
         "grade: \"6\"-\"12\" or null\n"
     )
+    logger.info("[classify-intent] ctx_json: %s", ctx_json)
     try:
         resp = _intent_client.messages.create(
             model="claude-haiku-4-5-20251001",

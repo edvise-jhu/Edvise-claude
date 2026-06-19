@@ -1607,7 +1607,7 @@ def run_sel_analysis(
     return result
 
 
-ROW_LEVEL_MAX_RECORDS = 300
+ROW_LEVEL_MAX_RECORDS = 4651
 
 
 def _extract_student_id_from_message(message: str) -> Optional[str]:
@@ -1648,8 +1648,28 @@ def run_row_level_analysis(
     """
     df = calculate_risk_flags(df.copy(), mapping, thresholds)
 
-    # Include every column — raw + computed flags
-    records = _json_safe_records(df.fillna('').to_dict(orient='records'))
+    # Pre-filter using the message so Claude only sees relevant records
+    if message:
+        dynamic_filters = resolve_dynamic_filters(message, mapping, df)
+        if dynamic_filters:
+            df = apply_dynamic_filters(df, mapping, dynamic_filters)
+
+    # Only send columns Claude needs — strip computed internals and reduce payload size
+    ALWAYS_INCLUDE = {'chronic_absent', 'has_suspension', 'has_academic_failure', 
+                      'flag_count', 'days_missed_pct', 'risk_tier'}
+    mapped_cols = set()
+    for role, col in mapping.items():
+        if role.startswith('_') or role in ('sel_factors', 'race_indicators', 'text_columns'):
+            continue
+        if isinstance(col, str) and col in df.columns:
+            mapped_cols.add(col)
+        elif isinstance(col, list):
+            for c in col:
+                if c in df.columns:
+                    mapped_cols.add(c)
+    sel_cols = set(mapping.get('sel_factors') or [])
+    keep_cols = [c for c in df.columns if c in mapped_cols or c in ALWAYS_INCLUDE or c in sel_cols]
+    records = _json_safe_records(df[keep_cols].fillna('').to_dict(orient='records'))
 
     # Normalize student IDs
     sid_col = mapping.get('student_id')
@@ -1687,12 +1707,14 @@ def run_row_level_analysis(
                 "thresholds_used": thresholds_used,
             }
 
-    truncated = len(records) > ROW_LEVEL_MAX_RECORDS
+    CLAUDE_CONTEXT_LIMIT = 500  # max records to send to Claude
+    total_matched = len(records)
+    truncated = total_matched > CLAUDE_CONTEXT_LIMIT
     return {
         "available": True,
         "mode": "cohort_sample",
-        "total": len(records),
-        "records": records[:ROW_LEVEL_MAX_RECORDS] if truncated else records,
+        "total": total_matched,
+        "records": records[:CLAUDE_CONTEXT_LIMIT] if truncated else records,
         "truncated": truncated,
         "col_descriptions": col_descriptions,
         "factor_labels": factor_labels,
@@ -1868,7 +1890,18 @@ def resolve_custom_groups(message: str, mapping: dict, df: pd.DataFrame, prior_l
         end = text.rfind("]") + 1
         if start == -1 or end == 0:
             return None
-        parsed = json.loads(text[start:end])
+        try:
+            parsed = json.loads(text[start:end])
+        except json.JSONDecodeError:
+            import re as _re
+            m = _re.search(r'\[[\s\S]*\]', text[start:end])
+            if m:
+                try:
+                    parsed = json.loads(m.group())
+                except Exception:
+                    return None
+            else:
+                return None
         if not isinstance(parsed, list) or len(parsed) == 0:
             return None
         return parsed
@@ -1878,6 +1911,14 @@ def resolve_custom_groups(message: str, mapping: dict, df: pd.DataFrame, prior_l
 
 
 def _apply_group_filter(df: pd.DataFrame, mapping: dict, g: dict) -> pd.DataFrame:
+    # Normalize "non_X" keys to X=0
+    normalized_g = {}
+    for k, v in g.items():
+        if k.startswith("non_") and k not in {"key", "label", "column", "value", "tier", "grade"}:
+            normalized_g[k[4:]] = 0
+        else:
+            normalized_g[k] = v
+    g = normalized_g
     result = df.copy()
     grade_col = mapping.get("grade")
 
@@ -1908,22 +1949,22 @@ def _apply_group_filter(df: pd.DataFrame, mapping: dict, g: dict) -> pd.DataFram
     # grade filter
     grade = str(g.get("grade") or "").strip().replace("Grade ", "")
     if grade and grade_col and grade_col in result.columns:
-        result = result[
-            result[grade_col].astype(str).str.strip()
-            .str.replace(r"\.0$", "", regex=True) == grade
-        ]
+        grade_series = pd.to_numeric(result[grade_col], errors="coerce")
+        result = result[grade_series.notna() & (grade_series.astype(int).astype(str) == grade)]
 
     # Dynamic demographic field filters — any key in the group spec that maps
     # to a scalar column in the mapping and has an integer value (0 or 1)
     SKIP_KEYS = {"key", "label", "column", "value", "tier", "grade", "exclude"}
     LIST_ROLES = {"sel_factors", "text_columns", "race_indicators"}
-    role_to_col = {
-        role: col for role, col in mapping.items()
-        if role not in SKIP_KEYS
-        and role not in LIST_ROLES
-        and not role.startswith("_")
-        and isinstance(col, str)
-    }
+
+    # Build role->column lookup from mapping
+    role_to_col = {}
+    for role, col in mapping.items():
+        if role in SKIP_KEYS or role in LIST_ROLES or role.startswith("_"):
+            continue
+        if isinstance(col, str) and col:
+            role_to_col[role] = col
+
     # ell and lep resolve to whichever is mapped
     ell_col = mapping.get("ell") or mapping.get("lep")
     if ell_col:
@@ -1936,12 +1977,13 @@ def _apply_group_filter(df: pd.DataFrame, mapping: dict, g: dict) -> pd.DataFram
         mapped_col = role_to_col.get(field)
         if not mapped_col or mapped_col not in result.columns:
             continue
-        try:
-            result = result[
-                pd.to_numeric(result[mapped_col], errors="coerce").fillna(-1) == int(field_val)
-            ]
-        except (TypeError, ValueError):
-            continue
+        target = int(field_val)
+        numeric = pd.to_numeric(result[mapped_col], errors="coerce")
+        if numeric.notna().sum() > len(result) * 0.5:
+            result = result[numeric.fillna(-1) == target]
+        else:
+            yes_vals = {"1", "yes", "y", "true", "t"} if target == 1 else {"0", "no", "n", "false", "f"}
+            result = result[result[mapped_col].astype(str).str.strip().str.lower().isin(yes_vals)]
 
     for field, field_val in g.get("exclude", {}).items():
         mapped_col = role_to_col.get(field)
@@ -2010,11 +2052,16 @@ def run_group_comparison(
         key = g.get("key", f"group_{len(result_groups)}")
         label = g.get("label", key)
 
+        FILTER_KEYS = {"column", "tier", "grade"}
+        SKIP_META = {"key", "label", "column", "value", "tier", "grade", "exclude"}
+        has_role_filter = any(
+            k not in SKIP_META and v is not None
+            for k, v in g.items()
+        )
         is_school_avg = key == "school_average" or (
-            not g.get("column") and not g.get("tier") and not g.get("grade")
+            not g.get("column") and not g.get("tier") and not g.get("grade") and not has_role_filter
         )
         group_df = df if is_school_avg else _apply_group_filter(df, mapping, g)
-        print(f"[group_comparison] group={key!r} n={len(group_df)} total={len(df)} spec={g}")  # TODO: remove
 
         n = len(group_df)
         if n == 0:
@@ -2185,7 +2232,15 @@ def resolve_dynamic_filters(message: str, mapping: dict, df: pd.DataFrame) -> di
         "- Use ACTUAL column names from the mapping above, not role names.\n"
         "- demographic_filters: list of role names (from the mapping keys) that should be filtered to their positive value (1/yes). Include ALL demographics mentioned — overage, ell, lep, special_ed, low_ses, gender etc.\n"
         "- column_filters: list of {column, value} for any additional column-level filters not covered by demographic_filters (e.g. specific race column values).\n"
-        "- tier: only set when the teacher explicitly names a risk tier.\n"
+        "- tier: ONLY set when teacher explicitly names a risk tier group.\n"
+        "  Triple flag / all three flags / highest risk → tier: 'triple'\n"
+        "  On track / no flags / no risk → tier: 'on_track'\n"
+        "  Do NOT use tier for individual indicator conditions like attendance or suspension.\n"
+        "- positive_flags: computed risk flags that must be TRUE for matching students.\n"
+        "  Attendance problems of any kind (low attendance, chronically absent, missing school, etc.) → chronic_absent\n"
+        "  Suspended / has suspension / behavior issues → has_suspension\n"
+        "  Failing courses / academic failure → has_academic_failure\n"
+        "  Valid values: chronic_absent, has_suspension, has_academic_failure\n"
         "- grade: only set when scoping TO a single grade, not comparing across grades.\n"
         "- min_numeric: list of {role, minimum} for any 'at least N' numeric conditions on mapped roles.\n"
         "- sort_by: role name to sort by descending.\n\n"
@@ -2196,20 +2251,49 @@ def resolve_dynamic_filters(message: str, mapping: dict, df: pd.DataFrame) -> di
         '  "demographic_filters": ["ell", "special_ed", "overage"] | [],\n'
         '  "column_filters": [{"column": "col_name", "value": 1}] | [],\n'
         '  "min_numeric": [{"role": "failtot", "minimum": 3}] | [],\n'
-        '  "sort_by": "failtot" | null\n'
-        "}"
+        '  "sort_by": "failtot" | null,\n'
+        '  "positive_flags": [],\n'
+        '  "negative_flags": [],\n'
+        '  "sel_thresholds": []\n'
+        "}\n\n"
+        "negative_flags: computed risk flags that must be FALSE for matching students.\n"
+        "  ONLY use for positive academic/behavioral performance conditions:\n"
+        "  'passing courses', 'not failing', 'high academics' → has_academic_failure\n"
+        "  'not suspended', 'no suspensions', 'good behavior', 'no behavior issues' → has_suspension\n"
+        "  ONLY add has_suspension if teacher explicitly mentions suspension or behavior. Never infer it.\n"
+        "  NEVER put chronic_absent or attendance conditions here.\n"
+        "  Valid values: has_academic_failure, has_suspension\n"
+        "  For attendance conditions (low attendance, chronically absent, missing school):\n"
+        "  use tier='two_or_more' or demographic_filters, NOT negative_flags.\n"
+        "sel_thresholds: conditions on SEL survey score columns ONLY.\n"
+        "  SEL columns are social-emotional survey scores on a 1-5 scale.\n"
+        "  Examples: connect, equity, future, acdeng, support, acdpress, caring.\n"
+        "  NEVER use attendance columns (attrate, days_absent) as sel_thresholds.\n"
+        "  operator: lt (less than), gt (greater than), lte, gte\n"
+        "  column: must be one of the sel_factors from the mapping\n"
+        "  value: numeric threshold on 1-5 scale. For 'low X' use 3.0. For 'below average' use 3.5.\n"
     )
 
     try:
         resp = _claude.messages.create(
             model="claude-haiku-4-5-20251001",
-            max_tokens=400,
+            max_tokens=600,
             messages=[{"role": "user", "content": prompt}],
         )
         text = resp.content[0].text.strip()
         start = text.find("{")
         end = text.rfind("}") + 1
-        return json.loads(text[start:end])
+        try:
+            return json.loads(text[start:end])
+        except json.JSONDecodeError:
+            import re as _re
+            m = _re.search(r'\{[\s\S]*\}', text[start:end])
+            if m:
+                try:
+                    return json.loads(m.group())
+                except Exception:
+                    pass
+            return {}
     except Exception as e:
         print(f"[resolve_dynamic_filters] failed: {e}")
         return {}
@@ -2304,9 +2388,42 @@ def run_students_analysis(
     min_suspension_count: Optional[int] = None,
     min_course_failures: Optional[int] = None,
     sort_by: Optional[str] = None,
+    message_filters: Optional[dict] = None,
 ) -> dict:
     """Student list stage - filter by tier, sort by severity, return rows + summary."""
     df = calculate_risk_flags(df, mapping, thresholds)
+
+    # Apply complex filters from natural language message
+    if message_filters:
+        # Positive flag filters — student must have these flags
+        for flag in message_filters.get("positive_flags") or []:
+            flag = str(flag).strip()
+            if flag in df.columns:
+                df = df[df[flag].astype(bool)].copy()
+
+        # Negative flag filters — student must NOT have these flags
+        for flag in message_filters.get("negative_flags") or []:
+            flag = str(flag).strip()
+            if flag in df.columns:
+                df = df[~df[flag].astype(bool)].copy()
+
+        # SEL threshold filters
+        for sel_thresh in message_filters.get("sel_thresholds") or []:
+            col = sel_thresh.get("column")
+            operator = str(sel_thresh.get("operator") or "lt").strip().lower()
+            value = sel_thresh.get("value")
+            if not col or col not in df.columns or value is None:
+                continue
+            numeric = pd.to_numeric(df[col], errors="coerce")
+            if operator == "lt":
+                df = df[numeric < float(value)].copy()
+            elif operator == "lte":
+                df = df[numeric <= float(value)].copy()
+            elif operator == "gt":
+                df = df[numeric > float(value)].copy()
+            elif operator == "gte":
+                df = df[numeric >= float(value)].copy()
+
     # Keep tier buckets only for student-list filtering UX.
     df['risk_tier'] = 'on_track'
     df.loc[df['flag_count'] == 1, 'risk_tier'] = 'moderate'
